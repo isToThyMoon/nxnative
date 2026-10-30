@@ -268,10 +268,10 @@ static void guest_file_init(void) {
     const double G = 1073741824.0; const char *e = getenv("DM_GUEST_FILE"), *d = getenv("DM_GUEST_FILE_DIR"), *mf = getenv("DM_GUEST_FILE_MIN_FREE");
 #if TARGET_OS_IPHONE
     uint64_t room = os_proc_available_memory();
-    int want = guest_file_wanted(e, DM_GAME_APP_POOL, room);
-    LOG("[mem] guest memory: memory pool %.2f GB, room to the memory limit %.2f GB, DM_GUEST_FILE %s: %s", DM_GAME_APP_POOL / G, room / G, e && *e ? e : "unset", want ? "in files" : "anonymous");
+    int want = guest_file_wanted(e, dm_profile()->app_pool, room);
+    LOG("[mem] guest memory: memory pool %.2f GB, room to the memory limit %.2f GB, DM_GUEST_FILE %s: %s", dm_profile()->app_pool / G, room / G, e && *e ? e : "unset", want ? "in files" : "anonymous");
 #else
-    int want = guest_file_wanted(e, DM_GAME_APP_POOL, 0);
+    int want = guest_file_wanted(e, dm_profile()->app_pool, 0);
 #endif
     if (!want) return;
     g_gf_min_free = mf && *mf ? env_size("DM_GUEST_FILE_MIN_FREE", 0, 0x100000) : (uint64_t)2 << 30;
@@ -288,8 +288,8 @@ static void guest_file_init(void) {
     LOG("[mem] guest memory: %d files of %.2f GB in %s (unlinked, sparse, shared), %.2f GB in all, on the %s volume, %.1f GB free on it (%.1f with what the system can purge); holes punched where the game gives memory back: %s",
         n, chunk / G, dir, g_reserve / G, fs.f_fstypename, avail / G, imp / G, g_gf_punch ? "on" : "off (DM_GUEST_FILE_PUNCH=0)");
     // The files take up to what the game touches, at most about its memory pool while what it gives back is punched out
-    if (g_gf_min_free && most < DM_GAME_APP_POOL + g_gf_min_free)
-        LOG("[RED] [mem] guest file: the files may take up to the memory pool, %.1f GB, and %.1f GB is free: the game is stopped if under %.1f GB is left", DM_GAME_APP_POOL / G, most / G, g_gf_min_free / G);
+    if (g_gf_min_free && most < dm_profile()->app_pool + g_gf_min_free)
+        LOG("[RED] [mem] guest file: the files may take up to the memory pool, %.1f GB, and %.1f GB is free: the game is stopped if under %.1f GB is left", dm_profile()->app_pool / G, most / G, g_gf_min_free / G);
     if (strcmp(fs.f_fstypename, "apfs") || !(fs.f_flags & MNT_LOCAL)) LOG("[RED] [mem] guest file: not on a local APFS volume, where it may not be sparse, or be slow");
     pthread_t th; int rc = pthread_create(&th, NULL, guest_file_thread, NULL);
     if (!rc) pthread_detach(th);
@@ -727,11 +727,11 @@ static uint64_t alias_room(void) {
 static void stdalloc_init(uint64_t *r, int param) {
     (void)param;
     if (r[1]) return;   // a heap over memory the game passes in: no address region
-    uint64_t cap = DM_GAME_STDALLOC_CAP ? DM_GAME_STDALLOC_CAP : alias_room();
+    uint64_t cap = dm_profile()->stdalloc_cap ? dm_profile()->stdalloc_cap : alias_room();
     if (!cap || r[2] <= cap) return;
     char who[40]; uint64_t via; guest_caller(r, who, sizeof who, &via);
     LOG("[mem] StandardAllocator::Initialize(nullptr, %.2f GB) returning to %s: %.2f GB of address space, %s", r[2] / 1073741824.0, who, cap / 1073741824.0,
-        DM_GAME_STDALLOC_CAP ? "the profile's stdalloc_cap" : "what the alias region has room for (the profile key stdalloc_cap sets it)");
+        dm_profile()->stdalloc_cap ? "the profile's stdalloc_cap" : "what the alias region has room for (the profile key stdalloc_cap sets it)");
     r[2] = cap;
 }
 // ---- Unreal's engine region ----

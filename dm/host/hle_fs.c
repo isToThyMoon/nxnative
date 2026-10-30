@@ -692,14 +692,14 @@ HLE_FORCE("_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE",
 HLE_FORCE("_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", "fsp-srv; another program's save data: none", Result, h_fs_MountSaveRO, const char *name, uint64_t app, const void *uid) {
     (void)uid; LOG("[RED] fs read-only mount of another program's save data %s: program %016llx, the host has none", name, (unsigned long long)app); return 0x7d402u;   // fs ResultTargetNotFound
 }
-const char *dm_save_title(void) { return DM_GAME_ID; }   // save_sync.h: the iPhone launcher names the cloud file with it before the game runs
+const char *dm_save_title(void) { return dm_profile()->id; }   // save_sync.h: the iPhone launcher names the cloud file with it before the game runs
 HLE_FORCE("_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", "fsp-srv; save data → host directory (single user)", Result, h_fs_MountSave, const char *name, const void *uid) { dm_thread_service_request();
     (void)uid;
     // No default directory: silently landing on a directory with no characters distorts the "character select" measurement (this once caused a misjudgment). Runs always use a fresh copy of save_ref
     const char *d = getenv("DM_SAVE");
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;   // strip trailing slashes (.work / .new are appended at the same level)
-    save_sync_mount(dd, DM_GAME_ID);   // DM_SAVE_SYNC: the cloud's save comes in before the work directory is cloned from the committed one (save_sync.h)
+    save_sync_mount(dd, dm_profile()->id);   // DM_SAVE_SYNC: the cloud's save comes in before the work directory is cloned from the committed one (save_sync.h)
     return mount_ex(name, dd, 0, 1);
 }
 // Device save data: one save for the console instead of one per user. Animal Crossing: New Horizons keeps its island there (3.0.3's main mounts no account save data at all); the host
@@ -712,7 +712,7 @@ HLE_FORCE("_ZN2nn2fs19MountDeviceSaveDataEPKc", "fsp-srv; device save data → t
     const char *d = getenv("DM_SAVE");
     if (!d) die("DM_SAVE is not set: point it at a writable copy of a save directory");
     char dd[1024]; strlcpy(dd, d, sizeof dd); size_t L = strlen(dd); while (L > 1 && dd[L - 1] == '/') dd[--L] = 0;
-    save_sync_mount(dd, DM_GAME_ID);   // the cloud's save holds both, so it comes in at whichever of the two mounts first
+    save_sync_mount(dd, dm_profile()->id);   // the cloud's save holds both, so it comes in at whichever of the two mounts first
     strlcat(dd, "_device", sizeof dd);
     return mount_ex(name, dd, 0, 1);
 }
