@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
     vs = create(GL_VERTEX_SHADER); assert(vs); delete(vs); assert(!shader_of(vs));   // the names are free again
 
     unsigned long sz;
-    const hle_ent *sec = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swhle", &sz);
+    const hle_ent *sec = (const hle_ent *)getsectiondata(DM_HOST_IMAGE, "__DATA", "swhle", &sz);
     unsigned count = 0;
     for (unsigned long i = 0; i < sz / sizeof *sec; i++)
         if (!strncmp(sec[i].name, "gl", 2)) {
