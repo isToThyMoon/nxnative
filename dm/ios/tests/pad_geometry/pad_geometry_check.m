@@ -214,6 +214,42 @@ static void check_arrangement(const Screen *screens, int nscreens) {
                     }
 }
 
+static void check_duo_outer_custom_bounds(void) {
+    Screen s = {"Duo outer landscape", {{0, 0}, {956, 440}}, {0, 62, 20, 62}, NO, CGRectNull};
+    DmLayout ordinary = dm_layout(s.bounds, s.insets, NO, CGRectNull, DM_PICTURE_16_9);
+    DmLayout outer = ordinary;
+    outer.customControlsFullBounds = dm_layout_custom_controls_full_bounds(s.bounds, YES);
+    if (!outer.customControlsFullBounds || dm_layout_custom_controls_full_bounds(s.bounds, NO)
+        || dm_layout_custom_controls_full_bounds(CGRectMake(0, 0, 440, 956), YES))
+        FAIL("custom touch bounds are only enabled for a closed landscape hinge");
+
+    DmPadGeo base = dm_pad_geo(s.bounds, s.insets, ordinary, NO, (DmPadOptions){1});
+    DmPadGeo unchanged = dm_pad_geo(s.bounds, s.insets, outer, NO, (DmPadOptions){1});
+    if (!geo_equal(&base, &unchanged) || !CGRectEqualToRect(base.safe, unchanged.safe)
+        || !CGPointEqualToPoint(base.drop[DM_PAD_ZL], unchanged.drop[DM_PAD_ZL]))
+        FAIL("Duo outer custom bounds changed the built-in positions");
+
+    DmPadLayout m; dm_pad_layout_parse("1;2d/zl:-5,0", &m);
+    DmPadOptions o = {1, 0, &m};
+    DmPadGeo safe = dm_pad_geo(s.bounds, s.insets, ordinary, NO, o);
+    DmPadGeo expanded = dm_pad_geo(s.bounds, s.insets, outer, NO, o);
+    CGFloat step = base.faceR / 2;
+    if (!(expanded.moved & (1u << DM_PAD_C_ZL)) || expanded.dropped
+        || !NEAR(expanded.drop[DM_PAD_ZL].x, base.drop[DM_PAD_ZL].x - 5 * step)
+        || !(expanded.drop[DM_PAD_ZL].x - expanded.dropR[DM_PAD_ZL] < CGRectGetMinX(expanded.safe))
+        || expanded.drop[DM_PAD_ZL].x - expanded.dropR[DM_PAD_ZL] < CGRectGetMinX(s.bounds))
+        FAIL("Duo outer: a moved shoulder did not use the full screen bounds");
+    if (!(safe.drop[DM_PAD_ZL].x > expanded.drop[DM_PAD_ZL].x))
+        FAIL("ordinary landscape: a moved shoulder used the expanded bounds");
+    check_geo(&s, NO, &safe, "safe-area clamp");
+    check_geo(&s, NO, &expanded, "custom bounds");
+
+    dm_pad_layout_parse("1;2d/zl:0,5", &m);   // into the L shoulder: the larger region must not relax collision checks
+    expanded = dm_pad_geo(s.bounds, s.insets, outer, NO, o);
+    if (!(expanded.dropped & (1u << DM_PAD_C_ZL)) || !CGPointEqualToPoint(expanded.drop[DM_PAD_ZL], base.drop[DM_PAD_ZL]))
+        FAIL("Duo outer: full bounds allowed a moved shoulder to overlap another");
+}
+
 int main(void) {
     const Screen screens[] = {
         // iPhone landscape (the phone's only orientation): the Dynamic Island or notch on one side, the home indicator at the bottom.
@@ -319,6 +355,7 @@ int main(void) {
 
     check_layout_values();
     check_arrangement(screens, nscreens);
+    check_duo_outer_custom_bounds();
 
     if (!g_fail) printf("ok: %d screens, %d arrangements\n", nscreens, g_arranged);
     return g_fail > 100 ? 100 : g_fail;

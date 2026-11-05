@@ -37,7 +37,7 @@ typedef struct {
 
 typedef struct {
     CGFloat u;                            // the unit every size below is a multiple of
-    CGRect safe, corner;                  // the top row lives in safe, the bottom-corner controls in corner (reaching halfway into the side insets)
+    CGRect safe, corner, customBounds;    // built-in areas; customBounds, when set after placement, is only for manual moves
     BOOL portrait;                        // separated and taller than wide: both thumbs' clusters sit in the controls region's middle band
     CGPoint face; CGFloat faceGap, faceR, faceHitR;   // the A B X Y diamond: centre, key distance from it, key radius, hit radius
     CGPoint stick; CGFloat stickR, knobR;             // the left stick: ring centre and radius, knob radius
@@ -91,7 +91,7 @@ static inline CGPoint dm_pad_diamond_key(CGPoint c, CGFloat d, int i) {
 static inline DmPadGeo dm_pad_geo_at(CGRect bounds, UIEdgeInsets insets, DmLayout layout, BOOL full, CGFloat u) {
     DmPadGeo g; memset(&g, 0, sizeof g);
     BOOL sep = layout.separated;
-    g.u = u;
+    g.u = u; g.customBounds = CGRectNull;
     g.safe = CGRectIntersection(layout.controls, UIEdgeInsetsInsetRect(bounds, dm_game_safe_insets(bounds, insets, layout.topSafeOnly)));
     UIEdgeInsets ci = insets; ci.left *= DM_PAD_CORNER_IN; ci.right *= DM_PAD_CORNER_IN;
     g.corner = sep ? g.safe : UIEdgeInsetsInsetRect(bounds, ci);
@@ -142,16 +142,18 @@ typedef struct { CGPoint c; CGFloat r; CGRect rect; BOOL isRect; CGRect within; 
 enum { DM_PAD_SHAPE_FACE = 0, DM_PAD_SHAPE_STICK = 4, DM_PAD_SHAPE_DPAD, DM_PAD_SHAPE_DROP, DM_PAD_SHAPE_TIP = 10, DM_PAD_SHAPE_CLICK = 14, DM_PAD_SHAPE_PILL = 16, DM_PAD_SHAPE_SWAP = 18 };
 static inline int dm_pad_shapes(const DmPadGeo *g, BOOL full, DmPadShape out[_Nonnull 20]) {
     int n = 0;
-    for (int i = 0; i < 4; i++) out[n++] = (DmPadShape){dm_pad_face_key(g, i), g->faceR, CGRectNull, NO, g->corner, DM_PAD_SHAPE_FACE + i};
-    out[n++] = (DmPadShape){g->stick, g->stickR, CGRectNull, NO, g->corner, DM_PAD_SHAPE_STICK};
-    if (full) out[n++] = (DmPadShape){g->dpad, hypot(g->dpadR, g->armW), CGRectNull, NO, g->corner, DM_PAD_SHAPE_DPAD};
+    CGRect safe = CGRectIsNull(g->customBounds) ? g->safe : g->customBounds;
+    CGRect corner = CGRectIsNull(g->customBounds) ? g->corner : g->customBounds;
+    for (int i = 0; i < 4; i++) out[n++] = (DmPadShape){dm_pad_face_key(g, i), g->faceR, CGRectNull, NO, corner, DM_PAD_SHAPE_FACE + i};
+    out[n++] = (DmPadShape){g->stick, g->stickR, CGRectNull, NO, corner, DM_PAD_SHAPE_STICK};
+    if (full) out[n++] = (DmPadShape){g->dpad, hypot(g->dpadR, g->armW), CGRectNull, NO, corner, DM_PAD_SHAPE_DPAD};
     for (int i = 0; i < 4; i++) {
-        out[n++] = (DmPadShape){g->drop[i], g->dropR[i], CGRectNull, NO, g->safe, DM_PAD_SHAPE_DROP + i};
-        out[n++] = (DmPadShape){dm_pad_drop_tip(g, i), 0, CGRectNull, NO, g->safe, DM_PAD_SHAPE_TIP + i};
+        out[n++] = (DmPadShape){g->drop[i], g->dropR[i], CGRectNull, NO, safe, DM_PAD_SHAPE_DROP + i};
+        out[n++] = (DmPadShape){dm_pad_drop_tip(g, i), 0, CGRectNull, NO, safe, DM_PAD_SHAPE_TIP + i};
     }
-    if (full) for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){g->click[i], g->clickR, CGRectNull, NO, g->safe, DM_PAD_SHAPE_CLICK + i};
-    for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){CGPointZero, 0, g->pill[i], YES, g->safe, DM_PAD_SHAPE_PILL + i};
-    out[n++] = (DmPadShape){g->swap, g->swapR, CGRectNull, NO, g->safe, DM_PAD_SHAPE_SWAP};
+    if (full) for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){g->click[i], g->clickR, CGRectNull, NO, safe, DM_PAD_SHAPE_CLICK + i};
+    for (int i = 0; i < 2; i++) out[n++] = (DmPadShape){CGPointZero, 0, g->pill[i], YES, safe, DM_PAD_SHAPE_PILL + i};
+    out[n++] = (DmPadShape){g->swap, g->swapR, CGRectNull, NO, safe, DM_PAD_SHAPE_SWAP};
     return n;
 }
 static inline BOOL dm_pad_shape_inside(const DmPadShape *s) {
@@ -370,6 +372,7 @@ static inline void dm_pad_arrange(DmPadGeo *g, BOOL full, BOOL separated, const 
 // The geometry the gamepad draws, hit-tests and grabs with: the size and the stick's place (dm_pad_geo_placed), then the player's arrangement.
 static inline DmPadGeo dm_pad_geo(CGRect bounds, UIEdgeInsets insets, DmLayout layout, BOOL full, DmPadOptions o) {
     DmPadGeo g = dm_pad_geo_placed(bounds, insets, layout, full, o);
+    if (layout.customControlsFullBounds && bounds.size.width > bounds.size.height && !layout.separated) g.customBounds = bounds;
     if (o.layout) dm_pad_arrange(&g, full, layout.separated, o.layout);
     return g;
 }
