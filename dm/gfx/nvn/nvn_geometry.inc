@@ -435,7 +435,7 @@ static id<MTLRenderPipelineState> geo_mesh_pso_for(NvProg *pr, id<MTLFunction> f
         for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
         m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
         const char *vk = vs->key, *fk = fs ? fs->key : "-", *gk = g_geo_mesh.lean->key; pso_key kk = k;
-        dispatch_async(pp_bg_queue(), ^{
+        bg_async(pp_bg_queue(), ^{
             NSError *e = nil; uint64_t t0 = bp_now();
             id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e];
             MLOG("%sgeometry mesh pipeline: vertex %s fragment %s kernel %s, %.1f ms in the background%s%s", p ? "" : "[RED] ", vk, fk, gk, (bp_now() - t0) / 1e6, p ? "" : ": ", p ? "" : e.localizedDescription.UTF8String);
@@ -566,10 +566,17 @@ static uint64_t g_mtk_n, g_mtk_wait;
 static nvn_hmap g_pso_mtk = {.klen = sizeof(pso_key)};   // only the submit thread uses it: prewarm workers build pipelines (mtk_build) and the submit thread claims them (warm_claim)
 // A mesh pipeline must have a fragment function, where a vertex one need not (validateWithDevice). A task / mesh program with no pixel shader draws depth only (Ocarina of Time's foliage shadows).
 // Noted for Metal 4 (fn4_note) so that such a pipeline goes through the compiler and the archive like the others
+static id<MTLFunction> g_mtk_nop_fn; static int g_mtk_nop_done;
 static id<MTLFunction> mtk_nop_fragment(void) {
-    static id<MTLFunction> fn; static dispatch_once_t once;
-    dispatch_once(&once, ^{ NSError *e = nil; id<MTLLibrary> l = [g_dev newLibraryWithSource:@"fragment void dm_mesh_nop() {}" options:nil error:&e];
-        fn = fn4_note([l newFunctionWithName:@"dm_mesh_nop"], l, @"dm_mesh_nop", nil); if (!fn) MLOG("[RED] the empty fragment function did not compile: %s", e.localizedDescription.UTF8String); });
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    os_unfair_lock_lock(&lock);
+    if (!g_mtk_nop_done) {
+        g_mtk_nop_done = 1;
+        NSError *e = nil; id<MTLLibrary> l = [g_dev newLibraryWithSource:@"fragment void dm_mesh_nop() {}" options:nil error:&e];
+        g_mtk_nop_fn = fn4_note([l newFunctionWithName:@"dm_mesh_nop"], l, @"dm_mesh_nop", nil); if (!g_mtk_nop_fn) MLOG("[RED] the empty fragment function did not compile: %s", e.localizedDescription.UTF8String);
+    }
+    id<MTLFunction> fn = g_mtk_nop_fn;
+    os_unfair_lock_unlock(&lock);
     return fn;
 }
 // The Metal 4 descriptor of a native mesh pipeline, whole: no base with open colour state, as a game has some hundred of them, each with functions of its own. Its depth / stencil
@@ -1072,6 +1079,7 @@ static int geo_run_walk(id<MTL4RenderCommandEncoder> re) {
     S = s0; R = r0; g_pso_dirty = pd; g_dss_dirty = dd;
     return n;
 }
+static id<MTLComputePipelineState> g_geo_pack[5];   // count, parallel scan, write, fused small draw, legacy scan
 static void geo_draw(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, uint32_t primitive_base) { cp_stamp start = cp_begin(); geo_draw_(pr, dw0, di0, primitive_base); cp_end(6, start); }
 static void geo_draw_(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, uint32_t primitive_base) {
     for (int i = 1; i < g_geo_nrun; i++) if (g_geo_run[i].op && g_geo_run[i].op == g_exec_cur) {
@@ -1087,7 +1095,7 @@ static void geo_draw_(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, uint
     if (geo_cut_on()) sub_cut();
     geo_job *j0 = &g_geo_run[0];
     if (geo_prep(pr, dw0, di0, j0, 1, primitive_base) <= 0) return;
-    static id<MTLComputePipelineState> pack[5];   // count, parallel scan, write, fused small draw, legacy scan
+    id<MTLComputePipelineState> __strong *pack = g_geo_pack;
     if (!pack[4]) { NSError *e = nil; id<MTLLibrary> lib = host_lib("geo_pack", &e);
         const char *fn[5] = {"geo_pack_count", "geo_pack_scan", "geo_pack_write", "geo_pack_small", "geo_pack_scan_legacy"};
         for (int i = 0; i < 5 && lib; i++) if (!(pack[i] = [g_dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@(fn[i])] error:&e])) break;
@@ -1147,4 +1155,24 @@ static void geo_draw_(NvProg *pr, const p_draw *dw0, const p_draw_idx *di0, uint
     if (ce) enc_c_end(ce);
     args_dirty_all(); g_enc_pso = nil; g_enc_dss = nil; g_ed.ok = 0;
     geo_raster(j0, n == 1);
+}
+static void geo_teardown(void) {
+    while (g_geo_ix_first) geo_ix_drop(g_geo_ix_first);
+    nvn_hm_clear(&g_geo_ix, NULL);
+    os_unfair_lock_lock(&g_pso_mesh_lock);
+    nvn_hm_clear(&g_pso_mesh, hm_rel);
+    g_pso_mesh_building = nil;
+    os_unfair_lock_unlock(&g_pso_mesh_lock);
+    nvn_hm_clear(&g_pso_mtk, hm_rel);
+    g_geo_mesh_last = (typeof(g_geo_mesh_last)){0};
+    g_geo_mesh_runfn = nil;
+    g_geo_mesh = (typeof(g_geo_mesh)){0};
+    g_mrun = (typeof(g_mrun)){0};
+    g_mtk = (typeof(g_mtk)){0};
+    g_mtk_nop_fn = nil; g_mtk_nop_done = 0;
+    g_geo_program = nil;
+    for (int i = 0; i < 3; i++) g_geo_lean_k[i] = nil;
+    for (int i = 0; i < 5; i++) g_geo_pack[i] = nil;
+    for (int i = 0; i < GEO_RUN; i++) g_geo_run[i] = (geo_job){0};
+    g_geo_nrun = 0;
 }

@@ -504,29 +504,34 @@ done:
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER, g_mount_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 static _Atomic int g_on;
-static int g_mounted, g_want, g_busy, g_failed;   // the mount ran; a send asked for without a Commit (the mount found this save newer, a flush); a send running; the last one failed
+static int g_mounted, g_want, g_busy, g_failed, g_stop;   // the mount ran; a send asked for without a Commit (the mount found this save newer, a flush); a send running; the last one failed
 static uint64_t g_commits, g_sent;                // Commits seen; the Commits the last send covered
+static pthread_t g_sender_th;
 static char g_save[PATH_MAX], g_title[24], g_cloud[PATH_MAX];
 
 static void *sender(void *arg) {
     (void)arg;
     pthread_mutex_lock(&g_mu);
     for (;;) {
-        while (g_commits == g_sent && !g_want) pthread_cond_wait(&g_cv, &g_mu);
-        for (uint64_t seen = g_commits; !g_want; ) {   // quiet for QUIET_MS since the last Commit (a flush does not wait)
+        while (g_commits == g_sent && !g_want && !g_stop) pthread_cond_wait(&g_cv, &g_mu);
+        if (g_stop && g_commits == g_sent && !g_want) break;
+        for (uint64_t seen = g_commits; !g_want && !g_stop; ) {   // quiet for QUIET_MS since the last Commit (a flush does not wait)
             struct timespec ts; deadline(QUIET_MS, &ts);
             int r = 0;
-            while (!g_want && g_commits == seen && r != ETIMEDOUT) r = pthread_cond_timedwait(&g_cv, &g_mu, &ts);
+            while (!g_want && !g_stop && g_commits == seen && r != ETIMEDOUT) r = pthread_cond_timedwait(&g_cv, &g_mu, &ts);
             if (g_commits == seen) break;
             seen = g_commits;
         }
+        if (g_stop && g_commits == g_sent && !g_want) break;
         uint64_t upto = g_commits; g_want = 0; g_busy = 1;
         pthread_mutex_unlock(&g_mu);
         int ok = send_save(g_save, g_title, g_cloud);
         pthread_mutex_lock(&g_mu);
         g_busy = 0; g_sent = upto; g_failed = !ok;
         pthread_cond_broadcast(&g_cv);
+        if (g_stop) break;
     }
+    pthread_mutex_unlock(&g_mu);
     return NULL;
 }
 
@@ -590,7 +595,7 @@ static void mount_once(const char *save, const char *title) {
     g_failed = failed;
     pthread_t th;
     if (pthread_create(&th, NULL, sender, NULL)) { SRED("cannot start the sender: saves are not sent this session"); return; }
-    pthread_detach(th);
+    g_sender_th = th;
     atomic_store(&g_on, 1);
 }
 
@@ -645,6 +650,22 @@ int save_sync_flush(int timeout_ms) {
     int ok = !g_want && !g_busy && g_commits == g_sent && !g_failed;
     pthread_mutex_unlock(&g_mu);
     return ok;
+}
+
+void dm_save_sync_stop(void) {
+    if (!atomic_load(&g_on)) return;
+    save_sync_flush(500);
+    pthread_mutex_lock(&g_mu);
+    g_stop = 1;
+    pthread_cond_broadcast(&g_cv);
+    pthread_mutex_unlock(&g_mu);
+    if (g_sender_th) {
+        pthread_join(g_sender_th, NULL);
+        g_sender_th = 0;
+    }
+    atomic_store(&g_on, 0);
+    g_mounted = 0;
+    g_stop = 0;
 }
 
 int save_sync_after_exit(const char *save, const char *title) {   // save: DM_SAVE, its trailing slashes stripped as h_fs_MountSave strips them (the same <save>.sync and <save>-backups)

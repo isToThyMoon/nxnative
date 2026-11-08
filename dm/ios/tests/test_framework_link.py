@@ -183,6 +183,10 @@ class FrameworkLinkTests(unittest.TestCase):
         exported = run('nm', '-gU', binary).stdout
         for sym in ('_dmgame_image_marker', '_dm_glue_version', '_dm_glue_start_game', '_dm_glue_present_game', '_dm_glue_focus_event', '_dm_game_menu'):
             self.assertIn(sym, exported, f'{sym} is not exported by the shell framework')
+        defined = run('nm', binary).stdout
+        for sym in ('_dm_host_teardown_for_shell', '_dm_guest_memory_release',
+                    '_dm_threads_park_all', '_dm_modules_teardown', '_dm_gamepad_teardown'):
+            self.assertIn(sym, defined, f'{sym} is not linked into the shell framework')
         undef = run('nm', '-u', binary).stdout
         self.assertNotIn('__mh_execute_header', undef, 'the framework must read its own image header (__dso_handle), not the executable\'s')
 

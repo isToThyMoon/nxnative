@@ -12,6 +12,7 @@
 
 uint64_t now_ns(void) { return 1; }
 __thread _Atomic int dm_host_work;   // hle_thread.c
+void dm_host_lock(pthread_mutex_t *m) { pthread_mutex_lock(m); }
 static struct { void *ev; int bound, set; } g_ev[16];
 static int ev_slot(void *e) { for (int i = 0; i < 16; i++) if (g_ev[i].ev == e) return i; for (int i = 0; i < 16; i++) if (!g_ev[i].ev) { g_ev[i].ev = e; return i; } abort(); }
 void hle_bind_system_event(void *e, int autoclear) { (void)autoclear; g_ev[ev_slot(e)].bound = 1; }

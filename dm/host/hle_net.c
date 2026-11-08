@@ -73,10 +73,18 @@ static int efd_close(int fd) {
     if (!ok) return sk_fail();
     return 0;
 }
+__attribute__((weak)) int dm_teardown_is_parking(void) { return 0; }
+__attribute__((weak)) void dm_teardown_check_current_thread(void) {}
+void dm_net_wake_teardown(void) {
+    pthread_mutex_lock(&g_efd_m);
+    pthread_cond_broadcast(&g_efd_c);
+    pthread_mutex_unlock(&g_efd_m);
+}
 static int efd_read(int fd, uint64_t *out) {
     pthread_mutex_lock(&g_efd_m);
     int r = -1;
     for (;;) {
+        if (dm_teardown_is_parking()) { pthread_mutex_unlock(&g_efd_m); dm_teardown_check_current_thread(); return -1; }
         if (!efd_used(fd)) { t_skerr = SK_EBADF; break; }
         uint64_t *c = &g_efd[fd].count; int f = g_efd[fd].flags;
         if (*c) { if (f & 1) { *out = 1; *c -= 1; } else { *out = *c; *c = 0; } r = 0; break; }
@@ -128,6 +136,7 @@ int dm_sk_poll(void *fds, uint64_t n, int ms) {   // also hle_offline.c's plain 
     pthread_mutex_lock(&g_efd_m);
     int ready;
     while (!(ready = efd_ready(p, n, open))) {
+        if (dm_teardown_is_parking()) { pthread_mutex_unlock(&g_efd_m); dm_teardown_check_current_thread(); return 0; }
         int64_t left = limit - (int64_t)(guest_ns() - start);
         if (left <= 0) break;
         dm_guest_cond_wait_ns(&g_efd_c, &g_efd_m, dm_detclock_enabled() && left > 1000000 ? 1000000 : left);

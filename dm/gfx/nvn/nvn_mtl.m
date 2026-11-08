@@ -90,6 +90,17 @@ static void shmap_load(void);
 static int prepare_on(void);
 static int g_warm_started;
 static void warm_claim(void);
+static _Atomic int g_gfx_teardown;
+static dispatch_group_t g_bg_group __attribute__((section("__DATA,__dm_keep")));
+static dispatch_once_t g_bg_group_once __attribute__((section("__DATA,__dm_keep")));
+static inline dispatch_group_t bg_group(void) {
+    dispatch_once(&g_bg_group_once, ^{ g_bg_group = dispatch_group_create(); });
+    return g_bg_group;
+}
+static inline void bg_async(dispatch_queue_t q, dispatch_block_t b) {
+    if (atomic_load(&g_gfx_teardown)) return;
+    dispatch_group_async(bg_group(), q, ^{ if (!atomic_load(&g_gfx_teardown)) b(); });
+}
 
 static id<MTLDevice> g_dev;
 // The shaders the host writes itself (built-in kernels, clears, copies, index conversions, geometry packing, the present: dm/gfx/msl), compiled when the host is built and loaded by
@@ -333,7 +344,7 @@ static int rh_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_NVN_RT_
 // A heap whose texture was freed waits for the next texture it fits (with the switch off it is freed). Runs where the texture's last reference goes (defer_drain: the submit thread or a
 // completion handler)
 static void rh_wait(id<MTLHeap> heap) {
-    if (!heap) return;
+    if (!heap || atomic_load(&g_gfx_teardown)) return;
     if (!sw_on(rh_mode())) { res_remove(heap); return; }
     rh_ent e = {(void *)CFBridgingRetain(heap), heap.size, clock_gettime_nsec_np(CLOCK_MONOTONIC)};
     os_unfair_lock_lock(&g_rh_lk);
@@ -562,13 +573,14 @@ static int defer_drain(void) { int back = 0; @autoreleasepool {
 // A drain off the submit thread for entries whose fence had passed when they were queued. Between submissions no feedback handler comes: Ocarina of Time out of focus waits in
 // oe::PopNotificationMessage and submits nothing, while its streaming threads remade a run of about 10 MB of a virtual pool 70 times a second (vrun_set). Each old buffer waited for
 // the next submission's fence, and GPU allocated went from 11 to 20 GB in 12 s, with 6.7 GB of swap in 20 s (PR #1392). Entries handed back while g_smu was busy are tried again 10 ms later
+static _Atomic int g_defer_queued;
 static void defer_kick(void) {
-    static _Atomic int queued;
-    if (atomic_exchange(&queued, 1)) return;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool {
-        atomic_store(&queued, 0);   // before the drain: an entry queued during it kicks again
+    if (atomic_load(&g_gfx_teardown) || atomic_exchange(&g_defer_queued, 1)) return;
+    bg_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ @autoreleasepool {
+        atomic_store(&g_defer_queued, 0);   // before the drain: an entry queued during it kicks again
+        if (atomic_load(&g_gfx_teardown)) return;
         int back = defer_drain(); res_commit();
-        if (back) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ defer_kick(); });
+        if (back && !atomic_load(&g_gfx_teardown)) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ defer_kick(); });
     } });
 }
 // What a drain takes out of the residency set leaves it, and is released, at the set's next commit, which the next submission makes. With none open none may come: the drain is
@@ -685,6 +697,7 @@ void mtl_init(void) {
         g_feedback_q = dispatch_queue_create("dm.nvn.mtl4-feedback", feedback_attr);
         MTL4CommandQueueDescriptor *q4d = [MTL4CommandQueueDescriptor new]; q4d.feedbackQueue = g_feedback_q;
         g_q4 = [g_dev newMTL4CommandQueueWithDescriptor:q4d error:&re];
+        q4d.feedbackQueue = nil;   // Metal's -[MTL4CommandQueueDescriptor setFeedbackQueue:] stores without dispatch_retain while -dealloc calls dispatch_release
         if (!g_q4) no4 = "failed to create the MTL4CommandQueue";
     }
     if (no4) {
@@ -4568,7 +4581,8 @@ static id<MTLTexture> tex_made(const tex_t *t) {
 }
 // NVN formats whose Metal format is the other one of an sRGB / linear pair (g_pfv_srgb) of a format's Metal format: up to 4, zero-terminated (an RGBA8 texture has RGBA8_SRGB and RGBX8_SRGB)
 static const uint8_t *srgb_twins(uint32_t f) {
-    static uint8_t tw[256][5]; static dispatch_once_t once;
+    static uint8_t tw[256][5] __attribute__((section("__DATA,__dm_keep")));
+    static dispatch_once_t once __attribute__((section("__DATA,__dm_keep")));
     dispatch_once(&once, ^{
         for (int a = 1; a < 256; a++) { uint32_t pa = 0, pb = 0; uint8_t sw[4]; int n = 0;
             if (!nvn_fmt_to_mtl(a, &pa, sw) || !pa) continue;
@@ -5919,7 +5933,12 @@ static NSString *exe_rel(const char *rel) {
 static void shmap_read(void);
 static void warm_start(void);
 // The shader map, the library directory and its tables, read once from any thread (the prefetch, mtl_prog_prefetch, runs on the game's threads)
-static void shmap_read_once(void) { static dispatch_once_t once; dispatch_once(&once, ^{ shmap_read(); }); }
+static void shmap_read_once(void) {
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT; static int done;
+    os_unfair_lock_lock(&lock);
+    if (!done) { done = 1; shmap_read(); }
+    os_unfair_lock_unlock(&lock);
+}
 // That, then the prewarm (warm_start) once: the submit thread and the tools only. The flag is set before warm_start runs, so a call from inside it (pso_prebuild) returns at
 // once; inside the dispatch_once that call re-entered it and libdispatch aborted (Tears of the Kingdom and Pokémon Scarlet at boot, chain d0e99bd4b2fe)
 static void shmap_load(void) { shmap_read_once(); static int warmed; if (!warmed) { warmed = 1; warm_start(); } }
@@ -8361,15 +8380,19 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
     d.vertexFunction = vs && vs->mesh_kind != 2 ? vs->fn : nil; d.fragmentFunction = fsfn ? fsfn : fs ? fs->fn : nil;   // mtk_pso copies the raster state only: a mesh function is not a vertex function
     // Diagnostic DM_NVN_HILITE=fragment shader key,...: these draws use a solid-color fragment instead (keys 1–6 in order magenta / green / cyan / yellow / blue / white), to see where the geometry lands
     // Pipelines are built on several threads at once: the keys and the library are set up once (a lazy setup raced, and a thread used a library another had just replaced: Hades II, 6 keys)
-    if (fs) { static char keys[6][24]; static int nk; static id<MTLLibrary> hl; static dispatch_once_t once;
-        dispatch_once(&once, ^{ const char *e = getenv("DM_NVN_HILITE");
+    if (fs) { static char keys[6][24]; static int nk, done; static id<MTLLibrary> hl; static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+        os_unfair_lock_lock(&lock);
+        if (!done) { done = 1; const char *e = getenv("DM_NVN_HILITE");
             for (const char *q = e; q && *q && nk < 6; q = strchr(q, ',') ? strchr(q, ',') + 1 : q + strlen(q)) { size_t n = strcspn(q, ","); if (n > 23) n = 23; memcpy(keys[nk], q, n); keys[nk++][n] = 0; }
-            if (!nk) return;
-            NSError *err = nil; hl = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nstruct O { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]]; };\n"
-                "fragment O hl0() { return {float4(1,0,1,1),float4(1,0,1,1),float4(1,0,1,1)}; } fragment O hl1() { return {float4(0,1,0,1),float4(0,1,0,1),float4(0,1,0,1)}; }\n"
-                "fragment O hl2() { return {float4(0,1,1,1),float4(0,1,1,1),float4(0,1,1,1)}; } fragment O hl3() { return {float4(1,1,0,1),float4(1,1,0,1),float4(1,1,0,1)}; }\n"
-                "fragment O hl4() { return {float4(0,0,1,1),float4(0,0,1,1),float4(0,0,1,1)}; } fragment O hl5() { return {float4(1,1,1,1),float4(1,1,1,1),float4(1,1,1,1)}; }\n" options:nil error:&err];
-            if (!hl) MLOG("[RED] HILITE shader compile failed %s", err.localizedDescription.UTF8String); });
+            if (nk) {
+                NSError *err = nil; hl = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nstruct O { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]]; };\n"
+                    "fragment O hl0() { return {float4(1,0,1,1),float4(1,0,1,1),float4(1,0,1,1)}; } fragment O hl1() { return {float4(0,1,0,1),float4(0,1,0,1),float4(0,1,0,1)}; }\n"
+                    "fragment O hl2() { return {float4(0,1,1,1),float4(0,1,1,1),float4(0,1,1,1)}; } fragment O hl3() { return {float4(1,1,0,1),float4(1,1,0,1),float4(1,1,0,1)}; }\n"
+                    "fragment O hl4() { return {float4(0,0,1,1),float4(0,0,1,1),float4(0,0,1,1)}; } fragment O hl5() { return {float4(1,1,1,1),float4(1,1,1,1),float4(1,1,1,1)}; }\n" options:nil error:&err];
+                if (!hl) MLOG("[RED] HILITE shader compile failed %s", err.localizedDescription.UTF8String);
+            }
+        }
+        os_unfair_lock_unlock(&lock);
         for (int i = 0; i < nk; i++) if (!strncmp(fs->key, keys[i], strlen(keys[i]))) {
             if (hl) d.fragmentFunction = [hl newFunctionWithName:[NSString stringWithFormat:@"hl%d", i]];
             break; } }
@@ -8789,7 +8812,8 @@ static void pso_bundle_open(NSMutableArray<id<MTL4Archive>> *archp) {
 // to another compiler, and serialization success does not end its lifetime. Only our output archives are ours to remove. iOS can reclaim previous runs' app-private folders
 // at cold start, before this run captures anything; never infer ownership from a live directory delta or remove compiler state at flush/exit.
 static NSString *ga_dir(void) {
-    static NSString *dir; static dispatch_once_t once;
+    static NSString *dir __attribute__((section("__DATA,__dm_keep")));
+    static dispatch_once_t once __attribute__((section("__DATA,__dm_keep")));
     dispatch_once(&once, ^{ char b[PATH_MAX]; if (confstr(_CS_DARWIN_USER_CACHE_DIR, b, sizeof b)) dir = [@(b) stringByAppendingPathComponent:@"com.apple.gpuarchiver"]; });
     return dir;
 }
@@ -8909,8 +8933,11 @@ static Method arch_read_method(void) { return class_getInstanceMethod([NSData cl
 static void arch_open_begin(void) { Method m = arch_read_method(); if (m) g_ns_read = (ns_read_fn)method_setImplementation(m, (IMP)arch_read_mapped); }
 static void arch_open_end(void) { Method m = arch_read_method(); if (m && g_ns_read) method_setImplementation(m, (IMP)g_ns_read); }
 static void pso4_init(void) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT; static int done;
+    os_unfair_lock_lock(&lock);
+    if (!done) {
+        done = 1;
+        (^void(void){
         if (!pso4_on() || ![(id)g_dev respondsToSelector:@selector(newCompilerWithDescriptor:error:)]) return;   // no Metal 4 compiler (t_pso_pending's fake device): the MTLDevice path
         const char *e = getenv("DM_PSO_ARCHIVE"); NSString *user = pso_user_path();
         g_arch_dir = e && !strcmp(e, "off") ? nil : e && *e ? @(e) : user ? [user.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_archive"] : nil;
@@ -8922,7 +8949,7 @@ static void pso4_init(void) {
             g_arch_pending = dispatch_group_create();
 #if TARGET_OS_IPHONE
             NSSet<NSString *> *old = ga_list();   // listed before any capture, so this run's own folder is never among them
-            if (old.count) dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            if (old.count) bg_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                 int n = 0; for (NSString *name in old) n += [NSFileManager.defaultManager removeItemAtPath:[ga_dir() stringByAppendingPathComponent:name] error:nil];
                 MLOG("pipeline archive: %d of Metal's build folders left by earlier runs removed", n);
             });
@@ -8980,7 +9007,9 @@ static void pso4_init(void) {
             if (g_arch_cap) atexit(arch_at_exit);   // what is not written yet, written at quit (mtl_arch_save)
             if (!g_ep) MLOG("[RED] pipeline archive: Metal made no pipeline serializer: nothing is captured into %s", g_arch_dir.UTF8String);
         }
-    });
+        })();
+    }
+    os_unfair_lock_unlock(&lock);
 }
 static int pso4_compiler(void) { pso4_init(); return g_comp4 != nil; }   // render pipelines go through the Metal 4 compiler (fn_spec)
 // Compute pipelines from the archive bundled with the app: it holds one per compute shader of the shader map and of the prewarm list's C rows (pso_offline.py), made from <key>_b's
@@ -8997,16 +9026,17 @@ static int pso4_compiler(void) { pso4_init(); return g_comp4 != nil; }   // rend
 static _Atomic uint64_t g_cps_arch, g_cps_run, g_cps_built, g_cps_look_ns, g_cps_build_ns;
 static void arch_note_new(void);
 static dispatch_queue_t arch_harvest_q(void) {   // one capture at a time, at utility QoS: a network shader's compile can take seconds, beside the game's frames
-    static dispatch_queue_t q; static dispatch_once_t once;
+    static dispatch_queue_t q __attribute__((section("__DATA,__dm_keep")));
+    static dispatch_once_t once __attribute__((section("__DATA,__dm_keep")));
     dispatch_once(&once, ^{ q = dispatch_queue_create("dm.nvn.arch-harvest", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
     return q;
 }
 // d into the flush period, in the background: a compute pipeline (cps_new) or a native mesh pipeline (mtk_build), which the MTLDevice built for its first use; compact: a
 // compaction's capture of a pipeline the prewarm took from an old file (as pso_build's bases)
 static void arch_harvest(MTL4PipelineDescriptor *d, int compact) {
-    if (!d) return;
+    if (!d || atomic_load(&g_gfx_teardown)) return;
     if (!arch_capturing()) { if (compact) g_compact_bad = 1; return; }
-    dispatch_async(arch_harvest_q(), ^{ @autoreleasepool {
+    bg_async(arch_harvest_q(), ^{ @autoreleasepool {
         NSError *ce = nil; int cap = 0, compute = [d isKindOfClass:MTL4ComputePipelineDescriptor.class];
         id ps = compute ? (id)arch_capture_cs((MTL4ComputePipelineDescriptor *)d, &ce, &cap) : (id)arch_capture(d, &ce, 0, &cap);
         if (cap) { if (compact) g_compacted++; arch_note_new(); }
@@ -9123,8 +9153,12 @@ static void arch_at_exit(void) { mtl_arch_save(ARCH_QUIT_WAIT_MS, 1); }
 // A flush, then every period handed over is written (not on g_arch_q, which writes them)
 static void arch_flush_wait(void) { arch_flush(); if (g_arch_pending) dispatch_group_wait(g_arch_pending, DISPATCH_TIME_FOREVER); }
 static void arch_note_new(void) {   // a base was compiled: flush 10 s later (one flush for a burst of them)
-    if (!g_arch_q || atomic_exchange(&g_arch_sched, 1)) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * (int64_t)NSEC_PER_SEC), g_arch_q, ^{ atomic_store(&g_arch_sched, 0); arch_flush(); });
+    dispatch_queue_t q = g_arch_q;
+    if (!q || atomic_load(&g_gfx_teardown) || atomic_exchange(&g_arch_sched, 1)) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * (int64_t)NSEC_PER_SEC), q, ^{
+        if (g_arch_q != q || atomic_load(&g_gfx_teardown)) return;
+        atomic_store(&g_arch_sched, 0); arch_flush();
+    });
 }
 static void arch_compact_finish(void) {   // after every period that may hold recaptured bases is written (arch_write): the old files go once their bases are in the new ones
     if (!g_compact_files || !g_compacted) return;
@@ -9311,7 +9345,10 @@ static int hybrid_on(void);
 // robin. At user-initiated QoS on the global queue, a cold start's burst (777 builds on entering Zora's Domain, Breath of the Wild) ran on every core, beside the game's own threads,
 // for the seconds it took. Speculative builds (pso_pend_kick: at most PSO_PEND_ACTIVE at a time) keep the global queue, so a demanded build never waits behind speculation
 static dispatch_queue_t pp_bg_queue(void) {
-    static dispatch_queue_t q[8]; static int n; static _Atomic unsigned rr; static dispatch_once_t once;
+    static dispatch_queue_t q[8] __attribute__((section("__DATA,__dm_keep")));
+    static int n __attribute__((section("__DATA,__dm_keep")));
+    static _Atomic unsigned rr __attribute__((section("__DATA,__dm_keep")));
+    static dispatch_once_t once __attribute__((section("__DATA,__dm_keep")));
     dispatch_once(&once, ^{ int pc = 0; size_t sz = sizeof pc; if (sysctlbyname("hw.perflevel0.physicalcpu", &pc, &sz, NULL, 0) || pc < 2) pc = 2;
         n = pc / 2 > 8 ? 8 : pc / 2;
         for (int i = 0; i < n; i++) q[i] = dispatch_queue_create("dm.nvn.pso-bg", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0)); });
@@ -9340,9 +9377,9 @@ static int pso_pend_slot(const pso_key *k, int spec, uint32_t *gen) {
 }
 static void pso_pend_start(int slot, uint32_t gen, MTLRenderPipelineDescriptor *d, int off, dispatch_queue_t q) {
     pthread_mutex_lock(&g_pp_mu); if (g_pp[slot].gen == gen) g_pp[slot].d = d; pthread_mutex_unlock(&g_pp_mu);   // only the submit thread takes a queued build, so none has yet
-    dispatch_async(q, ^{
+    bg_async(q, ^{
         pthread_mutex_lock(&g_pp_mu);
-        int go = g_pp[slot].used && g_pp[slot].gen == gen && !g_pp[slot].run; if (go) { g_pp[slot].run = 1; g_pp[slot].d = nil; }
+        int go = g_pp[slot].used && g_pp[slot].gen == gen && !g_pp[slot].run && !atomic_load(&g_gfx_teardown); if (go) { g_pp[slot].run = 1; g_pp[slot].d = nil; }
         pthread_mutex_unlock(&g_pp_mu);
         if (!go) return;   // the draw made it itself
         NSError *e = nil; id<MTLRenderPipelineState> ps = pso_build(d, off, &e);
@@ -9421,7 +9458,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> hybrid_get(const pso_key *
         pbase_key bk; pbase_key_of(d, off, &bk); NSData *kd = [NSData dataWithBytes:&bk length:sizeof bk];
         os_unfair_lock_lock(&g_hy_lock); if (!g_hy_kick_set) g_hy_kick_set = [NSMutableSet set];
         int fresh = ![g_hy_kick_set containsObject:kd]; if (fresh) [g_hy_kick_set addObject:kd]; os_unfair_lock_unlock(&g_hy_lock);
-        if (fresh) { g_hy_kicked++; dispatch_async(pp_bg_queue(), ^{ NSError *be = nil; (void)pso_build(d, off, &be); }); }
+        if (fresh) { g_hy_kicked++; bg_async(pp_bg_queue(), ^{ NSError *be = nil; (void)pso_build(d, off, &be); }); }
         g_hy_none++; return nil;
     }
     g_hy_made++; hm_put_id(&g_pso_hy, k, ps);
@@ -9635,9 +9672,11 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
     int n = (int)pairs.count; uint64_t t0 = bp_now();
     MLOG("pipeline prebuild: %d shader pairs of %s%s%s, %d workers (%s)", n, pp.UTF8String, txt2 ? " and " : "", txt2 ? pp2.UTF8String : "", threads, wait ? "tool" : prepare_on() ? "prepare step, before the first frame" : "background");
     atomic_store(&g_pre_next, 0);
+    dispatch_group_enter(bg_group());
     dispatch_group_t g = dispatch_group_create();
     for (int t = 0; t < threads; t++) dispatch_group_async(g, dispatch_get_global_queue(qos, 0), ^{
         for (;;) {
+            if (atomic_load(&g_gfx_teardown)) break;
             int i = atomic_fetch_add(&g_pre_next, 1);
             // the first worker to find no pair left hands the period over: it is written once the compiles still under way in it return, not after the slowest of all
             if (i >= n) { if (i == n) arch_flush(); break; }
@@ -9650,17 +9689,20 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
         }
     });
     dispatch_block_t done = ^{
-        arch_flush_wait();
-        NSMutableArray<NSString *> *fails = [NSMutableArray arrayWithArray:g_pre_known.allValues]; [fails addObjectsFromArray:g_pre_fails];
-        if (fails.count) [[NSString stringWithFormat:@"# pipeline prebuild: pairs whose base failed to build on this system build, left to the draws until it or the stamp changes (nvn_mtl.m, pre_fail_load)\n%@%@\n",
-                            pre_fail_head(want), [fails componentsJoinedByString:@"\n"]] writeToFile:failp atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        else unlink(failp.fileSystemRepresentation);
-        [pre_device_stamp(want) writeToFile:stamp atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        MLOG("pipeline prebuild done: %d pairs, %d bases built, %d already archived, %d left to the draws, %d failed, %.1f s", n, (int)g_pre_built, (int)g_pre_archived, (int)g_pre_skipped, (int)g_pre_failed, (bp_now() - t0) / 1e9);
-        if (g_pre_nolib) MLOG("[RED] pipeline prebuild: %d pairs need a library file this app does not carry (first: %s), left to the draws until a package with them is installed (the pulling libraries <key>_bp.metallib: an IPA packed with IOS_PULL=0 leaves them out)", (int)g_pre_nolib, g_pre_nolib_file.UTF8String);
-        if (fails.count) MLOG("pipeline prebuild: %lu pairs whose base failed are left to the draws (%s; %d of them failed on an earlier start of this system build, not built again); another system build tries them again",
-                              (unsigned long)fails.count, failp.UTF8String, (int)g_pre_known_n);
+        if (!atomic_load(&g_gfx_teardown)) {
+            arch_flush_wait();
+            NSMutableArray<NSString *> *fails = [NSMutableArray arrayWithArray:g_pre_known.allValues]; [fails addObjectsFromArray:g_pre_fails];
+            if (fails.count) [[NSString stringWithFormat:@"# pipeline prebuild: pairs whose base failed to build on this system build, left to the draws until it or the stamp changes (nvn_mtl.m, pre_fail_load)\n%@%@\n",
+                                pre_fail_head(want), [fails componentsJoinedByString:@"\n"]] writeToFile:failp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            else unlink(failp.fileSystemRepresentation);
+            [pre_device_stamp(want) writeToFile:stamp atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            MLOG("pipeline prebuild done: %d pairs, %d bases built, %d already archived, %d left to the draws, %d failed, %.1f s", n, (int)g_pre_built, (int)g_pre_archived, (int)g_pre_skipped, (int)g_pre_failed, (bp_now() - t0) / 1e9);
+            if (g_pre_nolib) MLOG("[RED] pipeline prebuild: %d pairs need a library file this app does not carry (first: %s), left to the draws until a package with them is installed (the pulling libraries <key>_bp.metallib: an IPA packed with IOS_PULL=0 leaves them out)", (int)g_pre_nolib, g_pre_nolib_file.UTF8String);
+            if (fails.count) MLOG("pipeline prebuild: %lu pairs whose base failed are left to the draws (%s; %d of them failed on an earlier start of this system build, not built again); another system build tries them again",
+                                  (unsigned long)fails.count, failp.UTF8String, (int)g_pre_known_n);
+        }
         g_pre_running = 0;
+        dispatch_group_leave(bg_group());
     };
     if (wait) { dispatch_group_wait(g, DISPATCH_TIME_FOREVER); done(); }
     else dispatch_group_notify(g, dispatch_get_global_queue(qos, 0), done);
@@ -9710,7 +9752,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> sm_amp_get(const pso_key *
     if (g_sm_amp_n >= SM_AMP_MAX) { os_unfair_lock_unlock(&g_sm_amp_lock); return nil; }
     g_sm_amp[i].k = *k; g_sm_amp[i].ps = nil; g_sm_amp[i].done = 0; g_sm_amp_n++; os_unfair_lock_unlock(&g_sm_amp_lock);
     MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); int off = !k->border;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NSError *e = nil; id<MTLRenderPipelineState> ps = pso_build(d, off, &e);
+    bg_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NSError *e = nil; id<MTLRenderPipelineState> ps = pso_build(d, off, &e);
         if (!ps) MLOG("[RED] slice-merged pass: no amplified pipeline for vertex %s fragment %s: %s (those passes stay apart)", vs->key, fs ? fs->key : "-", e.localizedDescription.UTF8String);
         os_unfair_lock_lock(&g_sm_amp_lock); g_sm_amp[i].ps = ps; g_sm_amp[i].done = 1; os_unfair_lock_unlock(&g_sm_amp_lock); });
     return nil;
@@ -9999,7 +10041,7 @@ static void warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
     __block _Atomic long next = 0;
     dispatch_group_t g = dispatch_group_create();
     for (int w = 0; w < workers; w++) dispatch_group_async(g, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        for (;;) { long i = atomic_fetch_add(&next, 1); if (i >= n) break; warm_task(tasks[(NSUInteger)i]); }
+        for (;;) { if (atomic_load(&g_gfx_teardown)) break; long i = atomic_fetch_add(&next, 1); if (i >= n) break; warm_task(tasks[(NSUInteger)i]); }
     });
     int shown = 0;
     while (dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 50 * (int64_t)NSEC_PER_MSEC))) {
@@ -10070,7 +10112,7 @@ static void warm_start(void) {
     }
     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);   // Not optional background work: it decides whether the pipelines are ready before the player enters a run
     dispatch_queue_t q = dispatch_queue_create("dm.nvn.pso-warm", attr);
-    dispatch_async(q, ^{ @autoreleasepool { long lines = 0; for (WarmTask *t in warm_parse(paths, &lines)) warm_task(t); warm_finish(); } });
+    bg_async(q, ^{ @autoreleasepool { long lines = 0; for (WarmTask *t in warm_parse(paths, &lines)) { if (atomic_load(&g_gfx_teardown)) break; warm_task(t); } if (!atomic_load(&g_gfx_teardown)) warm_finish(); else { g_warm_dict = nil; g_warm_loads = nil; atomic_store(&g_warm_running, 0); } } });
 }
 static id<MTLDepthStencilState> dss_get(int has_depth, int has_stencil) {
     struct { ds_st ds; uint32_t vm[2], wm[2]; int hd, hs; } k;
@@ -13230,7 +13272,7 @@ static int fb_tile_ready(NvShader *vs, NvShader *fs, id<MTLFunction> fn, const u
     if (g_fb_tp_n >= FB_TP_MAX) { os_unfair_lock_unlock(&g_fb_tp_lock); static int once; if (!once++) MLOG("same-pass feedback sampling: %d tile-reading pipelines built; later ones keep the snapshot", FB_TP_MAX); return 0; }
     g_fb_tp[i].k = k; g_fb_tp[i].ps = nil; g_fb_tp[i].done = 0; g_fb_tp_n++; os_unfair_lock_unlock(&g_fb_tp_lock);
     MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, fn, 1); int off = !k.border;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NSError *e = nil; id<MTLRenderPipelineState> ps = pso_build(d, off, &e);
+    bg_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ NSError *e = nil; id<MTLRenderPipelineState> ps = pso_build(d, off, &e);
         if (!ps) MLOG("[RED] same-pass feedback sampling: no tile-reading pipeline for vertex %s fragment %s: %s (its draws keep the snapshot)", vs->key, fs->key, e.localizedDescription.UTF8String);
         os_unfair_lock_lock(&g_fb_tp_lock); g_fb_tp[i].ps = ps; g_fb_tp[i].done = 1; os_unfair_lock_unlock(&g_fb_tp_lock); });
     return 0;
@@ -14480,7 +14522,7 @@ void mtl_prog_prefetch(const prog_t *cp) {
         if (st < 0) continue;   // not in the package: a built-in kernel (prog_get)
         NSString *pc = [k stringByAppendingString:@"_b"];
         if (!progpf_first(pc)) continue;
-        dispatch_async(pp_bg_queue(), ^{ @autoreleasepool {
+        bg_async(pp_bg_queue(), ^{ @autoreleasepool {
             NvShader *sh = shader_load(pc, st, 0);
             if (sh && st == 0 && sh->has_pull && !sh->layer_out && hybrid_on()) pull_load(sh);   // its pulling entry too, as the prewarm does (warm_shader)
             if (!sh) return;
@@ -14628,20 +14670,20 @@ static int tex_level_ok(id<MTLTexture> t, NSUInteger level, const char *what) {
 // The RGB565 family's red / blue exchange (rb_packed_shift) on the GPU, for copies between guest memory and a host texture: the copy runs on the GPU timeline, after GPU writes earlier in the
 // submission, so its bytes can only be converted there. wb bytes of each of rows rows in nz images, from src (row / img apart) to dst (drow / dimg apart); src == dst converts in place.
 // Dispatched in the copy encoder, ordered by its barriers (dispatch_enc)
+static id<MTLComputePipelineState> g_rb_swap_ps; static int g_rb_swap_failed;
 static int rb_swap_gpu(uint64_t src, size_t row, size_t img, uint64_t dst, size_t drow, size_t dimg, size_t wb, size_t rows, size_t nz, int shift) {
-    static id<MTLComputePipelineState> ps; static int failed;
-    if (failed) return 0;
-    if (!ps) {
+    if (g_rb_swap_failed) return 0;
+    if (!g_rb_swap_ps) {
         NSError *e = nil; id<MTLLibrary> lib = host_lib("rb_swap", &e);
         id<MTLFunction> fn = [lib newFunctionWithName:@"rb_swap"];
-        ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
-        if (!ps) { failed = 1; MLOG("[RED] cannot create the red / blue exchange for RGB565-family copies: %s", e.localizedDescription.UTF8String); return 0; }
+        g_rb_swap_ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+        if (!g_rb_swap_ps) { g_rb_swap_failed = 1; MLOG("[RED] cannot create the red / blue exchange for RGB565-family copies: %s", e.localizedDescription.UTF8String); return 0; }
     }
     id<MTLBuffer> pb; size_t po = arena_alloc(48, &pb);
     struct { uint64_t s, d; uint32_t w, h, row, img, drow, dimg, shift; } *p = (void *)((uint8_t *)pb.contents + po);
     *p = (typeof(*p)){src, dst, (uint32_t)(wb / 2), (uint32_t)rows, (uint32_t)row, (uint32_t)img, (uint32_t)drow, (uint32_t)dimg, (uint32_t)shift};
     id<MTL4ComputeCommandEncoder> e = dispatch_enc();
-    [g_ct setAddress:pb.gpuAddress + po atIndex:0]; enc_c_pso(e, ps);
+    [g_ct setAddress:pb.gpuAddress + po atIndex:0]; enc_c_pso(e, g_rb_swap_ps);
     enc_c_dispatch(e, MTLSizeMake((wb / 2 + 63) / 64, rows, nz), MTLSizeMake(64, 1, 1));
     static int once; if (!once++) MLOG("RGB565-family copy between guest memory and a host texture: red and blue exchanged on the GPU (first case %zux%zux%zu texels)", wb / 2, rows, nz);
     return 1;
@@ -16669,6 +16711,8 @@ static int link_30hz(void) { return !front_fullscreen() || front_screen_variable
 // target (docs/reference/frame-rate.md)
 static int link_vrr_120(void) { int hz = front_screen_max_fps(); return !g_present_link_env && front_fullscreen() && front_screen_variable_refresh() && hz >= 120 && hz % 120 == 0; }
 static int g_link_mode = 1;   // Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
+static pthread_t g_link_th;
+static int g_link_th_valid;
 static void *link_main(void *arg) {   // Display link thread: started when switching to display-link mode, exits when switching back to 0
     (void)arg;
     pthread_setname_np("nvn-present-link");
@@ -16683,6 +16727,7 @@ static void *link_main(void *arg) {   // Display link thread: started when switc
     [link addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
     g_link_rl = CFRunLoopGetCurrent(); g_link = link;
     CFRunLoopRun();   // When switching back to mode 0 the display link object is invalidated and this thread exits (nextDrawable cannot get a drawable while the layer still has the display link object attached, so pausing alone is not enough)
+    g_link_rl = NULL;
     g_link_started = 0;
     return NULL;
 }
@@ -16713,7 +16758,8 @@ static void link_sync(void) {   // Called every frame by the game's present thre
     if (!g_link_started) {
         if (!want) { applied = 0; return; }
         if (!front_metal_layer()) return;
-        g_link_started = 1; pthread_t th; if (pthread_create(&th, NULL, link_main, NULL)) MDIE("cannot start the display link thread"); pthread_detach(th);
+        if (g_link_th_valid) { pthread_join(g_link_th, NULL); g_link_th_valid = 0; }
+        g_link_started = 1; if (pthread_create(&g_link_th, NULL, link_main, NULL)) MDIE("cannot start the display link thread"); g_link_th_valid = 1;
         return;   // The display link object is created on a new thread; align again next frame
     }
     CAMetalDisplayLink *link = g_link; if (!link) return;
@@ -16739,6 +16785,8 @@ static void present_drop_for_suspend(void) {
     }
     pthread_mutex_unlock(&g_pq_mu);
 }
+static pthread_t g_present_th;
+static int g_present_started, g_present_stop;
 static void *present_main(void *arg) {
     (void)arg;
     pthread_setname_np("nvn-present");
@@ -16746,7 +16794,8 @@ static void *present_main(void *arg) {
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0; pthread_get_qos_class_np(pthread_self(), &qc, &rp); atomic_store(&g_present_qos, (uint32_t)qc);
     for (;;) {
         pthread_mutex_lock(&g_pq_mu);
-        while (g_pq_read == g_pq_in || g_link_owns_layer) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // In display-link mode the display-link callback takes them; an empty queue is judged by "taken"; "done" has to wait for the feedback of the present submit and lags behind taken
+        while ((g_pq_read == g_pq_in || g_link_owns_layer) && !g_present_stop) pthread_cond_wait(&g_pq_cv, &g_pq_mu);   // In display-link mode the display-link callback takes them; an empty queue is judged by "taken"; "done" has to wait for the feedback of the present submit and lags behind taken
+        if (g_present_stop) { pthread_mutex_unlock(&g_pq_mu); break; }
         pq_item it = g_pq[g_pq_read % PQ];
         uint64_t ticket = ++g_pq_read; g_classic_busy = 1;
         pthread_mutex_unlock(&g_pq_mu);
@@ -16764,7 +16813,7 @@ static void *present_main(void *arg) {
     return NULL;
 }
 uint32_t mtl_present_qos(void) { return atomic_load(&g_present_qos); }
-static void present_start(void) { pthread_t th; if (pthread_create(&th, NULL, present_main, NULL)) MDIE("cannot start the present thread"); pthread_detach(th); }
+static void present_start(void) { if (!g_present_started) { if (pthread_create(&g_present_th, NULL, present_main, NULL)) MDIE("cannot start the present thread"); g_present_started = 1; } }
 static _Atomic int g_present_discard;
 void mtl_link_pause(int on);
 // The short period when the front end goes to the background and waits for the game to save: presents are dropped directly (the display link does not call back in the background, enqueueing would block the game thread; nobody sees the picture anyway).
@@ -17135,4 +17184,228 @@ void mem_census(const char *why) { @autoreleasepool {
 } }
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #include "nvn_ndve.inc"      // DM_NDVE_ENGINE (nn::ndve's movie network)
+
+__attribute__((weak)) void dm_vk_teardown(void) {}
+__attribute__((weak)) void dm_gl_teardown(void) {}
+__attribute__((weak)) void nvn_hle_teardown(void) {}
+
+void dm_gfx_teardown(void) { @autoreleasepool {
+    atomic_store(&g_gfx_teardown, 1);
+    mtl_present_discard(1);
+    dispatch_group_wait(bg_group(), DISPATCH_TIME_FOREVER);
+
+    if (g_q) {
+        if (on_sub_thread()) { up_flush(); rec_drain(); }
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    if (g_dev) {
+        mtl_finish_gpu();
+        snap_drain();
+    }
+    if (g_feedback_q) dispatch_sync(g_feedback_q, ^{});
+    if (g_arch_pending) dispatch_group_wait(g_arch_pending, DISPATCH_TIME_FOREVER);
+    if (g_arch_q) dispatch_sync(g_arch_q, ^{});
+
+    if (g_link_started) {
+        while (g_link_started && !g_link_rl) usleep(1000);
+        CFRunLoopRef rl = g_link_rl;
+        CAMetalDisplayLink *link = g_link;
+        g_link = nil;
+        if (rl) {
+            CFRunLoopPerformBlock(rl, kCFRunLoopDefaultMode, ^{
+                [link invalidate];
+                pthread_mutex_lock(&g_pq_mu);
+                g_link_owns_layer = 0;
+                pthread_cond_broadcast(&g_pq_cv);
+                pthread_mutex_unlock(&g_pq_mu);
+                CFRunLoopStop(rl);
+            });
+            CFRunLoopWakeUp(rl);
+        }
+    }
+    if (g_link_th_valid) {
+        pthread_join(g_link_th, NULL);
+        g_link_th_valid = 0;
+    }
+    g_link_rl = NULL;
+
+    if (g_present_started) {
+        pthread_mutex_lock(&g_pq_mu);
+        g_present_stop = 1;
+        pthread_cond_broadcast(&g_pq_cv);
+        pthread_mutex_unlock(&g_pq_mu);
+        pthread_join(g_present_th, NULL);
+        g_present_started = 0;
+        g_present_stop = 0;
+    }
+
+    rec_teardown();
+    geo_teardown();
+    ndve_teardown();
+    dm_vk_teardown();
+    dm_gl_teardown();
+    nvn_hle_teardown();
+
+    os_unfair_lock_lock(&g_rmu);
+    for (int i = 0; i < g_ntreg; i++) treg_drop_views(&g_treg[i]);
+    free(g_treg); g_treg = NULL; g_ntreg = 0;
+    free(g_treg_transient); g_treg_transient = NULL; g_ntreg_transient = g_treg_transient_cap = 0;
+    for (int i = 0; i < g_nsreg; i++) {
+        if (g_sview[i]) CFRelease(g_sview[i]);
+        if (g_sview_w[i]) CFRelease(g_sview_w[i]);
+    }
+    free(g_sreg); free(g_sreg_ok); free(g_sview); free(g_srid); free(g_sview_w); free(g_srid_w); free(g_sbk);
+    g_sreg = NULL; g_sreg_ok = NULL; g_sview = NULL; g_srid = NULL; g_sview_w = NULL; g_srid_w = NULL; g_sbk = NULL; g_nsreg = 0;
+    tb2_gone_clear();
+    nvn_hm_clear(&g_vc, vc_set_free);
+    nvn_hm_clear(&g_treg_serial, NULL);
+    os_unfair_lock_unlock(&g_rmu);
+
+    pthread_mutex_lock(&g_smu);
+    nvn_hm_clear(&g_by_serial, hm_rel);
+    nvn_hm_clear(&g_ghost, hm_rel);
+    nvn_hm_clear(&g_alias, hm_rel);
+    nvn_hm_clear(&g_pkg_share, hm_rel);
+    nvn_hm_clear(&g_retire_held, hm_rel);
+    nvn_hm_clear(&g_image_desc, free);
+    nvn_hm_clear(&g_by_serial_held, NULL);
+    nvn_hm_clear(&g_ghost_held, NULL);
+    nvn_hm_clear(&g_alias_seen, NULL);
+    nvn_hm_clear(&g_tex_live, NULL);
+    if (g_alias_set) { CFRelease(g_alias_set); g_alias_set = NULL; }
+    pthread_mutex_unlock(&g_smu);
+
+    nvn_hm_clear(&g_prog_pins, free);
+    nvn_hm_clear(&g_cpu_unc, free);
+    nvn_hm_clear(&g_cpu_tex, NULL);
+    nvn_hm_clear(&g_cpu_tex_retired, NULL);
+    nvn_hm_clear(&g_vbuf_unaligned, free);
+    nvn_hm_clear(&g_ir, free);
+    nvn_hm_clear(&g_pso, hm_rel);
+    nvn_hm_clear(&g_dss, hm_rel);
+    nvn_hm_clear(&g_pso_fail, hm_rel);
+    nvn_hm_clear(&g_pbase, hm_rel);
+    nvn_hm_clear(&g_pbase_pending, hm_rel);
+    nvn_hm_clear(&g_pso_hy, hm_rel);
+    nvn_hm_clear(&g_cps, hm_rel);
+    nvn_hm_clear(&g_pool_ds, NULL);
+    nvn_hm_clear(&g_arch_ix, NULL);
+
+    os_unfair_lock_lock(&g_fn4_lock); g_fn4 = nil; os_unfair_lock_unlock(&g_fn4_lock);
+    os_unfair_lock_lock(&g_fn_dev_lock); g_fn_dev = nil; os_unfair_lock_unlock(&g_fn_dev_lock);
+    g_rb_swap_ps = nil; g_rb_swap_failed = 0;
+    g_tf_state = nil; g_tf_prepare = nil;
+
+    for (int i = 0; i < PSO_PEND_MAX; i++) { g_pp[i].ps = nil; g_pp[i].d = nil; g_pp[i].used = g_pp[i].done = g_pp[i].run = 0; }
+    for (int i = 0; i < g_sm_amp_n; i++) g_sm_amp[i].ps = nil;
+    g_sm_amp_n = 0;
+    for (int i = 0; i < g_fb_tp_n; i++) g_fb_tp[i].ps = nil;
+    g_fb_tp_n = 0;
+
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < g_nbig; i++) { free(g_big[i].chunk); g_big[i].chunk = NULL; g_big[i].old = nil; }
+    g_nbig = 0;
+    free(g_pools); g_pools = NULL; g_npool = g_cap = 0;
+    free(g_pidx); g_pidx = NULL; g_pidx_cap = 0;
+    free(g_addr); g_addr = NULL; g_naddr = g_addr_cap = 0;
+    g_keep = nil;
+    g_dead_pools = nil;
+    pthread_mutex_unlock(&g_mu);
+
+    for (int i = 0; i < POOL_SNAPS; i++) {
+        free(g_psnap[i].dead.v);
+        free(g_psnap[i].trans.v);
+        g_psnap[i] = (pool_snap){0};
+    }
+    for (int i = 0; i < POOL_SPARES; i++) { g_pool_spare[i].buf = nil; g_pool_spare[i].fence = 0; }
+    g_npool_spare = 0;
+    for (int k = 0; k < 2; k++) { free(g_pids[k].stamp); g_pids[k].stamp = NULL; g_pids[k].cap = 0; }
+    for (int i = 0; i < HTAB_SNAPS; i++) {
+        free(g_htab[i].copy);
+        free(g_htab[i].ser);
+        g_htab[i] = (htab_snap){0};
+    }
+    g_htab_last = NULL;
+    g_mrun.n = 0;
+    vis_clear(); free(g_vs); g_vs = NULL; g_vscap = 0;
+    for (int i = 0; i < VIS_RING; i++) { g_vis_ring[i].buf = nil; g_vis_ring[i].fence = 0; }
+    g_vis_ring_n = 0; g_vis_ring_i = -1; g_vis = nil;
+
+    free(g_post); g_post = NULL; g_npost = g_postcap = 0;
+    for (int i = 0; i < POST_RING; i++) { free(g_postr[i].ops); g_postr[i].ops = NULL; g_postr[i].n = 0; }
+    for (int i = 0; i < g_nup_blits; i++) { g_up_blits[i].src = nil; g_up_blits[i].dst = nil; }
+    free(g_up_blits); g_up_blits = NULL; g_nup_blits = g_up_blitcap = 0;
+    free(g_sp_free); g_sp_free = NULL; g_sp_nfree = g_sp_freecap = 0;
+    free(g_sp_late); g_sp_late = NULL; g_sp_nlate = g_sp_latecap = 0;
+    free(g_sp_tl); g_sp_tl = NULL; g_sp_ntl = 0;
+    free(g_sp_ph); g_sp_ph = NULL; g_sp_phcap = g_sp_phn = 0;
+    free(g_pg_pass); g_pg_pass = NULL; g_pg_np = g_pg_cap = 0;
+    free(g_gmem_slots); g_gmem_slots = NULL; g_gmem_nslots = g_gmem_cslots = 0;
+    free(g_cbs); g_cbs = NULL; g_cbs_n = g_cbs_cap = 0;
+    free(g_cbs_tally); g_cbs_tally = NULL; g_cbs_tally_n = g_cbs_tally_cap = 0;
+    free(g_sdx); g_sdx = NULL; free(g_sdx_tmp); g_sdx_tmp = NULL; g_sdx_n = g_sdx_cap = 0;
+    free(g_sdx_op); g_sdx_op = NULL; g_sdx_nop = g_sdx_opcap = 0;
+
+    romfs_img *mimg = atomic_exchange(&g_msl_img, NULL);
+    if (mimg) romfs_image_close(mimg);
+
+    g_shmap = nil; g_shmap_path = nil; g_msl_dir = nil;
+    g_shcache = nil; g_builtin = nil; g_builtin_lib = nil;
+    g_c1_banks = nil; g_c1_full = nil; g_cb_ext = nil;
+    g_warm_items = nil; g_warm_dict = nil; g_warm_loads = nil;
+    g_pso_user_seen = nil; g_progpf_seen = nil; g_hy_kick_set = nil;
+    g_pre_known = nil; g_pre_fails = nil; g_pre_nolib_file = nil; g_pre_nolib = 0;
+    g_arch_bundle = nil; g_bundle_dir = nil; g_arch_dir = nil;
+    g_arch4 = nil; g_arch4p = nil; g_arch_ixf = nil; g_arch_run = nil; g_compact_files = nil;
+    free(g_compact_state); g_compact_state = NULL;
+    g_ep = nil; g_arch_q = nil; g_arch_pending = nil;
+    g_comp4 = nil; g_dlss_comp = nil; g_fx_comp = nil;
+
+    g_arenas = nil; g_sub_arenas = nil; g_cur_arena = nil;
+    g_sp_heaps = nil; g_gml_free = nil; g_gmem_buf = nil; g_seen_buf = nil;
+    g_quad_ib = nil; g_fan_ib = nil;
+    g_up_texs = nil; g_up_views = nil; g_up_keep = nil;
+    g_up_block = nil; g_up_pblock = nil; g_ubs_buf = nil;
+    g_tbs_blk = nil; g_tbs_views = nil;
+    for (int i = 0; i < 3; i++) {
+        g_up_slot_blk[i] = nil; g_up_slot_over[i] = nil;
+        g_up_alloc4[i] = nil;
+        g_present_alloc4[i] = nil; g_present_cb[i] = nil; g_present_uv[i] = nil;
+    }
+    for (int i = 0; i < ALLOC_MAX; i++) g_alloc4[i] = nil;
+    g_alloc_n = g_alloc_cur = 0;
+    for (int i = 0; i < SNAP_MAX; i++) {
+        g_snap[i].tex = nil; g_snap[i].old = nil;
+        g_snap_alloc[i] = nil; g_snap_cb[i] = nil;
+    }
+    if (g_snap_res && g_q4) [g_q4 removeResidencySet:g_snap_res];
+    g_snap_res = nil; g_snap_ev = nil;
+
+    pthread_mutex_lock(&g_deferred_mu);
+    g_deferred = nil;
+    pthread_mutex_unlock(&g_deferred_mu);
+    atomic_store(&g_defer_queued, 0);
+
+    os_unfair_lock_lock(&g_rh_lk);
+    for (unsigned i = 0; i < g_rh_n; i++) if (g_rh[i].heap) CFRelease(g_rh[i].heap);
+    free(g_rh); g_rh = NULL; g_rh_n = g_rh_cap = 0; g_rh_bytes = 0;
+    os_unfair_lock_unlock(&g_rh_lk);
+
+    pthread_mutex_lock(&g_res_mu);
+    if (g_res && g_q4) [g_q4 removeResidencySet:g_res];
+    g_res_objects = nil;
+    g_res_last_use = nil;
+    g_res = nil;
+    pthread_mutex_unlock(&g_res_mu);
+
+    g_vt = nil; g_ft = nil; g_ct = nil; g_up_ct = nil; g_ot = nil; g_present_args = nil;
+    g_cb = nil; g_enc = nil; g_blit = nil; g_up_cb = nil; g_up_ce = nil;
+    g_commit_blocks = nil; g_prefetched_drawable = nil;
+    g_ev = nil; g_mdi_ev = nil; g_ext_ev = nil;
+    g_q4 = nil; g_q = nil; g_dev = nil;
+    g_feedback_q = nil;
+    atomic_store(&g_gfx_teardown, 0);
+} }
 #pragma clang attribute pop

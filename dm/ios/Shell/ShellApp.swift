@@ -60,7 +60,7 @@ private func withCStrings<R>(_ strings: [String], _ body: (UnsafePointer<UnsafeP
             fputs("shell: game \(entry.id) \(entry.title) at \(entry.frameworkURL?.lastPathComponent ?? "-")\(entry.problem.map { ", broken: \($0.reason), \($0.detail)" } ?? "")\n", stderr)
         }
         // DM_SHELL_PLAY=<title ID> in the launch environment (devicectl process launch --environment-variables, the Mac launcher's
-        // Play on device) starts that game as Play in the library would, through the same launcher: the library is skipped
+        // Play on device) starts that game as Play in the library would, through the same launcher
         if let id = ProcessInfo.processInfo.environment["DM_SHELL_PLAY"], !id.isEmpty {
             let state = model.details.first { $0.id == id }.map { "\($0.game.state)" } ?? "not in the library"
             fputs("shell: DM_SHELL_PLAY=\(id) (\(state))\n", stderr)

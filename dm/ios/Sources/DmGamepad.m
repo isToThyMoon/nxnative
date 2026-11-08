@@ -207,12 +207,11 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
             [_touchFeedback prepare];
         }
         _owner = [NSMapTable strongToStrongObjectsMapTable]; _faceOf = [NSMapTable strongToStrongObjectsMapTable];
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
+        if (!k_idle) {
             // each colour carries its own low opacity instead of lowering the whole view's alpha (that would add an off-screen pass for the full-screen layer)
             k_idle = [UIColor colorWithWhite:1 alpha:0.14]; k_on = [UIColor colorWithWhite:1 alpha:0.45]; k_line = [UIColor colorWithWhite:1 alpha:0.38];
             k_ringFill = [UIColor colorWithWhite:1 alpha:0.06]; k_text = [UIColor colorWithWhite:1 alpha:0.6]; k_textOn = [UIColor colorWithWhite:0 alpha:0.7];
-        });
+        }
         _controls = [CALayer layer]; [self.layer addSublayer:_controls];
         _ring = shape(_controls); _ring.fillColor = k_ringFill.CGColor;
         _knob = shape(_controls);
@@ -788,4 +787,27 @@ void dm_gamepad_reset(void) {   // On resign active: release everything (a key h
     pthread_mutex_lock(&g_mu); g_shake_btn = 0; pthread_mutex_unlock(&g_mu); publish();
     if (g_merge) dm_pad_set(0, 0, 0, 0, 0);
     else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p]) dm_pad_set_player(p, 0, 0, 0, 0, 0);
+}
+void dm_gamepad_teardown(void) {
+    if (g_motion) {
+        [g_motion stopAccelerometerUpdates];
+        [g_motion stopDeviceMotionUpdates];
+        if (@available(iOS 27.0, *)) g_motion.deviceMotionBody = nil;
+        g_motion = nil;
+    }
+    if (g_view) {
+        [NSNotificationCenter.defaultCenter removeObserver:g_view];
+        [g_view reset];
+        g_view = nil;
+    }
+    for (GCController *c in GCController.controllers) {
+        c.extendedGamepad.valueChangedHandler = nil;
+        c.extendedGamepad.buttonHome.pressedChangedHandler = nil;
+        for (int p = 0; p < DM_PLAYERS; p++) dm_motion_detach(c, p);
+    }
+    for (int p = 0; p < DM_PLAYERS; p++) {
+        dm_haptics_apple_controller(p, nil);
+        g_held[p] = nil;
+    }
+    k_idle = nil; k_on = nil; k_line = nil; k_ringFill = nil; k_text = nil; k_textOn = nil;
 }

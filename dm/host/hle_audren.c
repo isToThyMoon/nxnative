@@ -612,3 +612,26 @@ HLE_FORCE("_ZN2nn5audio38AcquireAudioDeviceNotificationForInputEPNS_2os11SystemE
 // SDK 7 names of the two above (Super Mario Odyssey): the device-switch event and the active channel count
 HLE_FORCE("_ZN2nn5audio36AcquireAudioDeviceSwitchNotificationEPNS_2os11SystemEventE", "output device switch notification (SDK 7 name): bound, never signaled", void, h_ad_Notify7, void *ev) { hle_bind_system_event(ev, 0); }
 HLE_FORCE("_ZN2nn5audio21GetActiveChannelCountEv", "output channel count (SDK 7 name): 2", int, h_ad_Channels7, void) { return 2; }
+
+void dm_audren_stop_all(void) {
+    for (int i = 0; i < AR_MAX; i++) {
+        atomic_store(&g_ar[i].open, 0);
+        if (g_ar[i].handle[0]) {
+            pthread_mutex_lock(&g_ar[i].cq_mu);
+            pthread_cond_broadcast(&g_ar[i].cq_cv);
+            pthread_mutex_unlock(&g_ar[i].cq_mu);
+        }
+    }
+}
+void dm_audren_teardown_post(void) {
+    for (int i = 0; i < AR_MAX; i++) {
+        if (g_ar[i].handle[0]) {
+            void *owned = objmap_del(g_ar[i].handle[0]);
+            free(owned);
+            free(g_ar[i].render_tt);
+            g_ar[i].render_tt = NULL;
+            g_ar[i].handle[0] = NULL;
+            g_ar[i].sys = NULL;
+        }
+    }
+}

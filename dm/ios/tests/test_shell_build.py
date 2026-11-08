@@ -125,6 +125,10 @@ class ShellMainProvidesWhatFrontIosTakes(unittest.TestCase):
         missing = [n for n in wanted_all if not re.search(r'^[A-Za-z_][\w \t\*]*?\b' + n + r'\([^)]*\)[ \t]*\{', glue, re.M)]
         self.assertEqual(missing, [], 'ShellGlue.m does not define what front_ios.m and ShellMain.m take')
         self.assertIn('dm_glue_version =', glue)
+        shell_main = (REPO / 'dm/ios/Shell/ShellMain.m').read_text()
+        self.assertRegex(shell_main, r'\bdm_shell_return_to_library\s*\(void\)')
+        self.assertIn('dm_shell_return_to_library', front)
+        self.assertIn('dm_host_teardown_for_shell', front)
 
 
 @unittest.skipUnless(HAS_TOOLS and font_python(), 'needs macOS, XcodeGen, an iPhoneOS SDK and a python with fontTools')
@@ -174,6 +178,8 @@ class ShellBuild(unittest.TestCase):
         self.assertIn('@executable_path/Frameworks', load)
         self.assertNotIn(fw.stem, subprocess.run(['otool', '-L', str(app / 'DmShell')], capture_output=True, text=True, check=False).stdout,
                          'the shell dlopens the game framework, it must not link it')
+        exported = subprocess.run(['nm', '-gU', str(app / 'DmShell')], capture_output=True, text=True, check=False).stdout
+        self.assertIn('_dm_shell_return_to_library', exported, 'the shell executable must export _dm_shell_return_to_library for front_ios.m dlsym')
 
 
 if __name__ == '__main__':

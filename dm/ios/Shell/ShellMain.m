@@ -4,21 +4,200 @@
 // dlopens the chosen game's DmGame<title ID>.framework (which links its own dm/host, front_ios.m and shaders), and calls its
 // dm_glue_start_game() entry point (ShellGlue.h, framework/ShellGlue.m). dm_shell_present_game() then hands the window to the
 // framework's dm_glue_present_game(), which shows front_ios.m's game view and starts dm_main on the big-stack thread.
-// One game per process: dm_profile() and dm_host_preload_start() run once, so returning to the library is a relaunch of the app.
+// When the player quits from the in-game prompt, dm_shell_return_to_library() restores the framework's writable data segments and returns the window to the library.
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach-o/getsect.h>
+#include <mach-o/ldsyms.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include "ShellEngine.h"
 #include "ShellGlue.h"
 #import "DmShell-Swift.h"
 
+extern char **environ;
+
+typedef struct {
+    uint8_t *data_ptr;
+    uint8_t *data_snap;
+    size_t data_sz;
+    uint8_t *common_ptr;
+    uint8_t *common_snap;
+    size_t common_sz;
+    uint8_t *bss_ptr;
+    size_t bss_sz;
+    struct { size_t off; uint64_t val; } *bss_nz;
+    size_t bss_nnz;
+} DmSegSnap;
+
+typedef struct {
+    const void *fbase;
+    DmSegSnap seg[2];
+} DmFwSnap;
+
 static dm_glue_present_fn g_present;
 static dm_glue_focus_fn g_focus;
+static UIViewController *g_library_vc;
+static char g_active_exe[1024];
+static const void *g_active_fbase;
+static DmFwSnap g_fw_snaps[64];
+static int g_nfw_snaps;
 static int g_boot_ok;
 
 static NSString *documents(void) { return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0]; }
+
+static void clear_game_env(void) {
+    if (!environ) return;
+    char names[256][128];
+    int count = 0;
+    for (char **ep = environ; *ep && count < 256; ep++) {
+        const char *kv = *ep;
+        if (strncmp(kv, "DM_", 3) != 0) continue;
+        const char *eq = strchr(kv, '=');
+        if (!eq) continue;
+        size_t len = (size_t)(eq - kv);
+        if (len == 0 || len >= sizeof(names[0])) continue;
+        if ((len == strlen("DM_HUD_PER_LAYER") && !strncmp(kv, "DM_HUD_PER_LAYER", len)) ||
+            (len == strlen("DM_SHELL_PLAY") && !strncmp(kv, "DM_SHELL_PLAY", len))) {
+            continue;
+        }
+        memcpy(names[count], kv, len);
+        names[count][len] = '\0';
+        count++;
+    }
+    for (int i = 0; i < count; i++) unsetenv(names[i]);
+}
+
+static void save_seg_snap(const struct mach_header_64 *mh, const char *segname, DmSegSnap *s) {
+    unsigned long dsz = 0, csz = 0, bsz = 0;
+    s->data_ptr = getsectiondata(mh, segname, "__data", &dsz); s->data_sz = dsz;
+    s->common_ptr = getsectiondata(mh, segname, "__common", &csz); s->common_sz = csz;
+    s->bss_ptr = getsectiondata(mh, segname, "__bss", &bsz); s->bss_sz = bsz;
+    if (s->data_ptr && s->data_sz) {
+        s->data_snap = malloc(s->data_sz);
+        if (s->data_snap) memcpy(s->data_snap, s->data_ptr, s->data_sz);
+    }
+    if (s->common_ptr && s->common_sz) {
+        s->common_snap = malloc(s->common_sz);
+        if (s->common_snap) memcpy(s->common_snap, s->common_ptr, s->common_sz);
+    }
+    if (s->bss_ptr && s->bss_sz) {
+        size_t pg = (size_t)getpagesize();
+        uintptr_t b0 = (uintptr_t)s->bss_ptr;
+        uintptr_t b1 = b0 + s->bss_sz;
+        uintptr_t p0 = b0 & ~(pg - 1);
+        uintptr_t p1 = (b1 + pg - 1) & ~(pg - 1);
+        size_t np = (p1 - p0) / pg;
+        char *vec = np ? malloc(np) : NULL;
+        int mc_ok = vec && mincore((const void *)p0, p1 - p0, vec) == 0;
+        size_t cap = 0;
+        for (size_t p = 0; p < np; p++) {
+            if (mc_ok && !(vec[p] & (MINCORE_INCORE | MINCORE_PAGED_OUT))) continue;
+            uintptr_t a0 = p0 + p * pg;
+            uintptr_t a1 = a0 + pg;
+            if (a0 < b0) a0 = (b0 + 7ULL) & ~7ULL;
+            if (a1 > b1) a1 = b1;
+            for (uintptr_t a = a0; a + 8 <= a1; a += 8) {
+                uint64_t v = *(const uint64_t *)a;
+                if (!v) continue;
+                if (s->bss_nnz == cap) {
+                    size_t ncap = cap ? cap * 2 : 64;
+                    void *nb = realloc(s->bss_nz, ncap * sizeof s->bss_nz[0]);
+                    if (!nb) break;
+                    s->bss_nz = nb; cap = ncap;
+                }
+                s->bss_nz[s->bss_nnz].off = (size_t)(a - b0);
+                s->bss_nz[s->bss_nnz].val = v;
+                s->bss_nnz++;
+            }
+        }
+        free(vec);
+    }
+}
+
+static void restore_seg_snap(const DmSegSnap *s) {
+    if (s->data_ptr && s->data_snap && s->data_sz) memcpy(s->data_ptr, s->data_snap, s->data_sz);
+    if (s->common_ptr && s->common_snap && s->common_sz) memcpy(s->common_ptr, s->common_snap, s->common_sz);
+    if (s->bss_ptr && s->bss_sz) {
+        size_t pg = (size_t)getpagesize();
+        uintptr_t b0 = (uintptr_t)s->bss_ptr;
+        uintptr_t b1 = b0 + s->bss_sz;
+        uintptr_t p0 = (b0 + pg - 1) & ~(pg - 1);
+        uintptr_t p1 = b1 & ~(pg - 1);
+        if (p1 > p0) {
+            if (p0 > b0) memset((void *)b0, 0, p0 - b0);
+            if (mmap((void *)p0, p1 - p0, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED)
+                memset((void *)p0, 0, p1 - p0);
+            if (b1 > p1) memset((void *)p1, 0, b1 - p1);
+        } else {
+            memset(s->bss_ptr, 0, s->bss_sz);
+        }
+        for (size_t i = 0; i < s->bss_nnz; i++) {
+            *(uint64_t *)(s->bss_ptr + s->bss_nz[i].off) = s->bss_nz[i].val;
+        }
+    }
+}
+
+static void save_framework_data(const void *fbase) {
+    if (!fbase) return;
+    for (int i = 0; i < g_nfw_snaps; i++) if (g_fw_snaps[i].fbase == fbase) return;
+    if (g_nfw_snaps >= 64) return;
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)fbase;
+    DmFwSnap *s = &g_fw_snaps[g_nfw_snaps++];
+    memset(s, 0, sizeof *s);
+    s->fbase = fbase;
+    save_seg_snap(mh, "__DATA", &s->seg[0]);
+    save_seg_snap(mh, "__DATA_DIRTY", &s->seg[1]);
+    fprintf(stderr, "shell: saved framework state for %p (__data=%#zx, __common=%#zx, __bss=%#zx with %zu initial non-zero words)\n",
+            fbase, s->seg[0].data_sz + s->seg[1].data_sz, s->seg[0].common_sz + s->seg[1].common_sz,
+            s->seg[0].bss_sz + s->seg[1].bss_sz, s->seg[0].bss_nnz + s->seg[1].bss_nnz);
+}
+
+static void restore_framework_data(const void *fbase) {
+    if (!fbase) return;
+    DmFwSnap *s = NULL;
+    for (int i = 0; i < g_nfw_snaps; i++) if (g_fw_snaps[i].fbase == fbase) { s = &g_fw_snaps[i]; break; }
+    if (!s) return;
+    restore_seg_snap(&s->seg[0]);
+    restore_seg_snap(&s->seg[1]);
+    fprintf(stderr, "shell: restored framework state for %p\n", fbase);
+}
+
+__attribute__((used, visibility("default")))
+void dm_shell_return_to_library(void) {
+    dispatch_block_t work = ^{
+        char finished_exe[1024];
+        strlcpy(finished_exe, g_active_exe, sizeof finished_exe);
+        const void *fbase = g_active_fbase;
+        g_active_fbase = NULL;
+        g_active_exe[0] = '\0';
+        g_focus = NULL;
+        g_present = NULL;
+        g_boot_ok = 0;
+        if (fbase) restore_framework_data(fbase);
+        UIWindow *window = nil;
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
+            if ([s isKindOfClass:UIWindowScene.class]) for (UIWindow *w in ((UIWindowScene *)s).windows) if (w.isKeyWindow || !window) window = w;
+        if (window && g_library_vc) {
+            window.traitOverrides.preferredContentSizeCategory = UIContentSizeCategoryUnspecified;
+            window.rootViewController = g_library_vc;
+            [g_library_vc setNeedsUpdateOfSupportedInterfaceOrientations];
+            if (@available(iOS 16.0, *)) {
+                [window.windowScene requestGeometryUpdateWithPreferences:[[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:UIInterfaceOrientationMaskAllButUpsideDown] errorHandler:nil];
+            }
+        }
+        NSString *slog = [documents() stringByAppendingPathComponent:@"shell-log.txt"];
+        fflush(stderr);
+        if (freopen(slog.fileSystemRepresentation, "a", stderr)) setvbuf(stderr, NULL, _IOLBF, 0);
+        fprintf(stderr, "shell: returned to library from %s\n", finished_exe);
+    };
+    if ([NSThread isMainThread]) work();
+    else dispatch_async(dispatch_get_main_queue(), work);
+}
 
 // One log file per run, the previous one kept beside it (<name>.prev.txt): the shell's own lines go to Documents/shell-log.txt until a
 // game starts, the game's (the host's stderr) to Documents/log.txt, the file the per-game app writes and the issue forms ask for.
@@ -35,9 +214,9 @@ static void log_to(NSString *log) {
 const char *dm_shell_start_game(const char *const *keys, const char *const *values, int n, const char *const *argv, int argc,
                                 const char *executable, const char *marker, const char *log_path, const char *cwd) {
     static char err[512];
-    static int started;
-    if (started++) return "A game was already started in this session. Close the app and open it again.";
-    if (argc < 2) return "The game's start arguments are incomplete.";
+    if (g_boot_ok) return "A game is already running.";
+    if (argc < 2 || !executable) return "The game's start arguments are incomplete.";
+    clear_game_env();
     log_to(@(log_path));
     fprintf(stderr, "shell: starting %s (%s)\n", argv[1], executable);
     for (int i = 0; i < n; i++) {
@@ -72,12 +251,16 @@ const char *dm_shell_start_game(const char *const *keys, const char *const *valu
         return err;
     }
     fprintf(stderr, "boot: game framework %s (handle %p, image base %p, glue v%d)\n", executable, h, info.dli_fbase, *ver);
+    save_framework_data(info.dli_fbase);
     const char *why = start(argv, argc, info.dli_fbase);
     if (why) {
         snprintf(err, sizeof err, "%s", why);
         fprintf(stderr, "[RED] boot: %s: %s\n", executable, err);
+        restore_framework_data(info.dli_fbase);
         return err;
     }
+    strlcpy(g_active_exe, executable, sizeof g_active_exe);
+    g_active_fbase = info.dli_fbase;
     g_present = present;
     g_focus = focus;
     g_boot_ok = 1;
@@ -117,7 +300,8 @@ static UIInterfaceOrientationMask shell_orientations(UITraitCollection *traits) 
 }
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)o {
     self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
-    self.window.rootViewController = [ShellLibrary makeController];
+    g_library_vc = [ShellLibrary makeController];
+    self.window.rootViewController = g_library_vc;
     [self.window makeKeyAndVisible];
 }
 // Forwarded to the running game framework's front_ios.m once a game has started

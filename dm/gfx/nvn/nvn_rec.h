@@ -28,6 +28,9 @@ static _Alignas(128) _Atomic uint64_t g_ubc_head;   // ops queued (monotonic; th
 static _Alignas(128) _Atomic uint64_t g_ubc_done;   // ops made (a waiter sleeps on it)
 static _Alignas(128) _Atomic uint32_t g_ubc_sleeping, g_ubc_waiting;   // the copy thread is asleep or about to be (it clears this itself) / waiters asleep or about to be
 static _Atomic uint64_t g_ubc_wakes;   // wake calls made, both ways (t_ubc_wait)
+static _Atomic int g_ubc_stop, g_ubc_exited;   // iOS shell teardown: the copy thread is asked to leave / has left
+static int g_ubc_started;
+static pthread_t g_ubc_th;
 #ifndef UBC_T_SLEEPING   // t_ubc_wait: holds the copy thread on its way to sleep, so that a late wake call lands there
 #define UBC_T_SLEEPING() ((void)0)
 #endif
@@ -40,20 +43,22 @@ static void *ubc_thread(void *arg) {
     (void)arg; pthread_setname_np("dm-ub-copy"); pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (uint64_t t = 0;;) {
         uint64_t h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);
-        for (int spin = 0; spin < 2000 && t == h; spin++) h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);   // a submission queues copies in bursts: stay awake a moment
-        while (t == h) {   // the flag first, then the word (both sequentially consistent, as the pusher's store and flag load): a push sees the flag or this sees the push
+        for (int spin = 0; spin < 2000 && t == h && !atomic_load_explicit(&g_ubc_stop, memory_order_relaxed); spin++) h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);   // a submission queues copies in bursts: stay awake a moment
+        while (t == h && !atomic_load(&g_ubc_stop)) {   // the flag first, then the word (both sequentially consistent, as the pusher's store and flag load): a push sees the flag or this sees the push
             atomic_store(&g_ubc_sleeping, 1);
-            if ((h = atomic_load(&g_ubc_head)) != t) break;
+            if ((h = atomic_load(&g_ubc_head)) != t || atomic_load(&g_ubc_stop)) break;
             UBC_T_SLEEPING();
             os_sync_wait_on_address(&g_ubc_head, t, sizeof g_ubc_head, OS_SYNC_WAIT_ON_ADDRESS_NONE);   // returns at once if the word is no longer t; EINTR and spurious returns loop
             atomic_store(&g_ubc_sleeping, 0);   // awake: set again before the next sleep's look at the word
             h = atomic_load(&g_ubc_head);
         }
+        if (t == h && atomic_load(&g_ubc_stop)) break;   // asked to leave, nothing left to copy
         atomic_store_explicit(&g_ubc_sleeping, 0, memory_order_relaxed);   // also when the look found a push
         for (; t < h; t++) { const ubc_op *o = &g_ubc[t % UBC_N]; memcpy(o->d, o->s, o->n); }
         atomic_store(&g_ubc_done, t);
         if (atomic_load(&g_ubc_waiting)) { atomic_fetch_add_explicit(&g_ubc_wakes, 1, memory_order_relaxed); os_sync_wake_by_address_all(&g_ubc_done, sizeof g_ubc_done, OS_SYNC_WAKE_BY_ADDRESS_NONE); }
     }
+    atomic_store(&g_ubc_exited, 1);
     return NULL;
 }
 // Wait until the first seq ops are made (the replay thread, or the encode thread at a commit): spin a moment, then sleep on g_ubc_done
@@ -73,8 +78,7 @@ static void ubc_wait(uint64_t seq) {
 static inline uint64_t ubc_head(void) { return atomic_load_explicit(&g_ubc_head, memory_order_relaxed); }
 // Queue a copy (submit thread only); returns the count of ops that must be made for it to be done
 static uint64_t ubc_push(void *d, const void *s, size_t n) {
-    static int started;
-    if (!started) { pthread_t th; if (pthread_create(&th, NULL, ubc_thread, NULL)) MDIE("cannot start the uniform copy thread"); pthread_detach(th); started = 1; }
+    if (!g_ubc_started) { atomic_store(&g_ubc_exited, 0); if (pthread_create(&g_ubc_th, NULL, ubc_thread, NULL)) MDIE("cannot start the uniform copy thread"); g_ubc_started = 1; }
     uint64_t h = atomic_load_explicit(&g_ubc_head, memory_order_relaxed);
     if (h - atomic_load_explicit(&g_ubc_done, memory_order_acquire) >= UBC_N) ubc_wait(h - UBC_N + 1);
     g_ubc[h % UBC_N] = (ubc_op){d, s, n};
@@ -114,7 +118,8 @@ static inline int rec_on(void) {
 static pthread_mutex_t g_rb_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_rb_work = PTHREAD_COND_INITIALIZER, g_rb_idle = PTHREAD_COND_INITIALIZER;
 static rec_blk *g_rb_cur, *g_rb_head, *g_rb_tail, *g_rb_free;   // the submit thread's open block; blocks waiting for the encode thread; empty blocks
-static int g_rb_busy, g_rb_started, g_rb_sleeping;              // the encode thread is working through a block; the thread exists; it waits for work
+static int g_rb_busy, g_rb_started, g_rb_sleeping, g_rb_stop;   // the encode thread is working through a block; the thread exists; it waits for work
+static pthread_t g_rb_th;
 
 static inline uint64_t rec_obj(id o) { return o ? (uint64_t)(uintptr_t)CFBridgingRetain(o) : 0; }
 static inline id rec_id(uint64_t v) { return (__bridge id)(void *)(uintptr_t)v; }
@@ -209,7 +214,8 @@ static void *rec_thread(void *arg) {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     for (;;) {
         pthread_mutex_lock(&g_rb_mu);
-        while (!g_rb_head) { g_rb_sleeping = 1; pthread_cond_wait(&g_rb_work, &g_rb_mu); g_rb_sleeping = 0; }
+        while (!g_rb_head && !g_rb_stop) { g_rb_sleeping = 1; pthread_cond_wait(&g_rb_work, &g_rb_mu); g_rb_sleeping = 0; }
+        if (!g_rb_head && g_rb_stop) { pthread_mutex_unlock(&g_rb_mu); break; }
         rec_blk *b = g_rb_head; g_rb_head = b->next; if (!g_rb_head) g_rb_tail = NULL; g_rb_busy = 1;
         pthread_mutex_unlock(&g_rb_mu);
         @autoreleasepool { for (int i = 0; i < b->n; i++) rec_exec(&b->r[i]); }
@@ -233,8 +239,8 @@ static rec_t *rec_put(uint32_t op, uint32_t nobj) {
     if (g_rb_cur && g_rb_cur->n == REC_BLK) rec_publish();
     if (!g_rb_cur) {
         pthread_mutex_lock(&g_rb_mu);
-        if (!g_rb_started) { pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 1 << 20);
-            if (pthread_create(&th, &at, rec_thread, NULL)) MDIE("deferred encoding: cannot start the encode thread"); pthread_attr_destroy(&at); g_rb_started = 1; }
+        if (!g_rb_started) { pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 1 << 20);
+            if (pthread_create(&g_rb_th, &at, rec_thread, NULL)) MDIE("deferred encoding: cannot start the encode thread"); pthread_attr_destroy(&at); g_rb_started = 1; }
         g_rb_cur = g_rb_free; if (g_rb_cur) g_rb_free = g_rb_cur->next;
         pthread_mutex_unlock(&g_rb_mu);
         if (!g_rb_cur) { g_rb_cur = malloc(sizeof *g_rb_cur); if (!g_rb_cur) MDIE("deferred encoding: out of memory"); }
@@ -251,6 +257,43 @@ static void rec_drain(void) {
     while (g_rb_head || g_rb_busy) { blocked = 1; pthread_cond_wait(&g_rb_idle, &g_rb_mu); }
     pthread_mutex_unlock(&g_rb_mu);
     if (ws_on()) ws_put(WS_DRAIN, w0, blocked);
+}
+static void rec_teardown(void) {
+    if (g_rb_started) {
+        rec_drain();
+        pthread_mutex_lock(&g_rb_mu);
+        g_rb_stop = 1;
+        pthread_cond_broadcast(&g_rb_work);
+        pthread_mutex_unlock(&g_rb_mu);
+        pthread_join(g_rb_th, NULL);
+        g_rb_started = 0;
+        g_rb_stop = 0;
+    }
+    if (g_ubc_started) {
+        ubc_wait(ubc_head());
+        atomic_store(&g_ubc_stop, 1);
+        while (!atomic_load(&g_ubc_exited)) {   // a wake that lands before the thread sleeps is not kept, so it is repeated until the thread has left
+            os_sync_wake_by_address_all(&g_ubc_head, sizeof g_ubc_head, OS_SYNC_WAKE_BY_ADDRESS_NONE);
+            usleep(100);
+        }
+        pthread_join(g_ubc_th, NULL);
+        g_ubc_started = 0;
+        atomic_store(&g_ubc_stop, 0);
+    }
+    if (g_rb_cur) {
+        for (int i = 0; i < g_rb_cur->n; i++)
+            for (uint32_t j = 0; j < g_rb_cur->r[i].nobj; j++)
+                if (g_rb_cur->r[i].a[j]) CFRelease((CFTypeRef)(uintptr_t)g_rb_cur->r[i].a[j]);
+        free(g_rb_cur);
+        g_rb_cur = NULL;
+    }
+    while (g_rb_free) {
+        rec_blk *next = g_rb_free->next;
+        free(g_rb_free);
+        g_rb_free = next;
+    }
+    g_rx_cb = nil;
+    g_rx_enc = nil;
 }
 // A block of records from another thread than the submit thread (the present snapshot's copy): it goes in one piece behind every block published so far. Everything the game
 // submitted before it presents is published by then (a submission publishes its records before it returns), so the block runs after the frame's work, and the presenting thread
