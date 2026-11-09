@@ -81,6 +81,21 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(data['romfs_identity'], 'DMROMFSID1 title=x size=1 index=2')
         self.assertEqual(data['min_os'], '26.0')
 
+    def test_the_console_comes_from_the_profiles_first_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for first, expected in (('# Donkey Kong Bananza (Switch 2, update v458752)', 'switch2'), ('# Fixture Game (update v1)', 'switch1')):
+                profile = Path(temporary) / 'game.tsv'
+                profile.write_text(first + '\nname\tx\n')
+                result, data = self.manifest('--profile', str(profile))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(data['console'], expected)
+                self.assertEqual(list(data)[-2:], ['min_os', 'console'], 'after the schema keys, which keep their order')
+
+    def test_without_a_profile_the_manifest_says_nothing_about_the_console(self):
+        result, data = self.manifest()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('console', data)
+
     def test_a_romfs_folder_has_no_identity_and_no_nro_table_counts_zero(self):
         result, data = self.manifest('--romfs-identity', '', nro=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -139,7 +154,7 @@ class FrameworkEnvironmentTests(unittest.TestCase):
             (root / 'tools').symlink_to(REPO / 'dm/ios/tools', target_is_directory=True)
             result = run_step(block, root, FRAMEWORK='1', FRAMEWORK_ONLY='out', FW_NAME='DmGame' + GAME,
                               PATCHED=str(root / 'patched'), ROMFS=str(root / 'none'), PREPARE_XCODE='NO', DM_COPY_ROMFS='NO',
-                              DM_DISPLAY_NAME='Fixture', DM_APP_VERSION='1.0', MODS='main', V='fixture', MARKER='marker', F='')
+                              DM_DISPLAY_NAME='Fixture', DM_APP_VERSION='1.0', MODS='main', V='fixture', MARKER='marker', F='', GD=str(root / 'gd'))
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertTrue((root / 'Gen/framework/dm/env.txt').is_file(), 'the built framework must carry its environment')
             self.assertEqual((root / 'Gen/framework/dm/env.txt').read_text(), 'DM_PROF_TEX_BC_CPU=1\n')

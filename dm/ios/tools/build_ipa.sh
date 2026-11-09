@@ -222,7 +222,7 @@ if [ "$FRAMEWORK" = 1 ]; then
   FW_LOADER=FR; [ -z "$FRAMEWORK_ONLY" ] || FW_LOADER=FH
   python3 tools/gen_manifest.py Gen/framework/game.manifest.json --game "$GAME" --name "$DM_DISPLAY_NAME" \
     --display-version "$DM_APP_VERSION" --package-version "${PKG:-}" --modules "$MODS" ${NRO_TABLE:+--nro-table "$NRO_TABLE"} \
-    --chain "b-$V" --romfs-marker "$MARKER" --romfs-identity "$ROMFS_ID" --framework-name "$FW_NAME" --loader "$FW_LOADER" > /dev/null || die "game manifest (gen_manifest.py)"
+    --chain "b-$V" --romfs-marker "$MARKER" --romfs-identity "$ROMFS_ID" --framework-name "$FW_NAME" --loader "$FW_LOADER" --profile "$GD/game.tsv" > /dev/null || die "game manifest (gen_manifest.py)"
   printf 'OTHER_LDFLAGS = $(inherited) %s\n' "$F" > Gen/framework.xcconfig || die "framework link flags"
   t "framework: Gen/framework (modules $MODS, profile.tsv, game.manifest.json)"
 fi

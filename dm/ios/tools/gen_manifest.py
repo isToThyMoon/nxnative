@@ -9,7 +9,7 @@ cross-checks the sections it names. Writing it now keeps the schema honest, and 
 Usage:
   gen_manifest.py <out.json> --game <title ID> --name <name> --display-version <v> --package-version <pkg>
                   --modules "main sdk" [--nro-table <nro.tsv>] --chain b-<hex> --romfs-marker <path>
-                  [--romfs-identity "DMROMFSID1 ..."] [--min-os 26.0]
+                  [--romfs-identity "DMROMFSID1 ..."] [--min-os 26.0] [--profile <dm/games/<title ID>/game.tsv>]
 Exit status 1 on a value the schema cannot carry (a bad title ID, no module, a chain not written b-<hex>).
 """
 import argparse
@@ -37,6 +37,20 @@ def nro_count(table):
         return 0
     rows = (line.split('\t')[0] for line in Path(table).read_text(encoding='utf-8').splitlines())
     return sum(1 for name in rows if name and not name.startswith('#') and name != 'refused')
+
+
+def console_of(profile):
+    """"switch2" for a Switch 2 game's profile, "switch1" for any other, None without a readable profile. No profile key says so yet:
+    every Switch 2 profile names it in its first line, "# Donkey Kong Bananza (Switch 2, update v458752)" (the launcher reads the
+    same line, GameFolder.profileIsSwitch2), so that line is the rule here too."""
+    if not profile:
+        return None
+    try:
+        with open(profile, encoding='utf-8', errors='replace') as f:
+            first = f.readline()
+    except OSError:
+        return None
+    return 'switch2' if first.startswith('#') and '(Switch 2' in first else 'switch1'
 
 
 def manifest(args):
@@ -74,6 +88,9 @@ def manifest(args):
         'romfs_identity': args.romfs_identity or '',
         'min_os': args.min_os,
     }
+    console = console_of(args.profile)
+    if console:
+        data['console'] = console   # the shell marks a Switch 2 game and warns about its memory (LNPANDY/NX2Apple#696)
     if args.built_by:
         data['built_by'] = args.built_by
     return data
@@ -97,6 +114,7 @@ def main(argv=None):
                          'games\' frameworks sit side by side in Frameworks/')
     ap.add_argument('--loader', default='FR', choices=('FR', 'FH'),
                     help='FR: a module container whose host is the app (M1); FH: the framework carries its own host (the shell, #451)')
+    ap.add_argument('--profile', help='the game\'s dm/games/<title ID>/game.tsv: console in the manifest comes from its first line')
     ap.add_argument('--built-by', help='who built it, for a log line (optional; a device or tool name)')
     args = ap.parse_args(argv)
     data = manifest(args)
