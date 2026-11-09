@@ -47,6 +47,15 @@ static void check_toggle_values(void) {
     char longv[DM_PAD_LAYOUT_MAX + 8]; memset(longv, 'a', sizeof longv - 1); longv[sizeof longv - 1] = 0;
     for (size_t i = 1; i < sizeof longv - 1; i += 2) longv[i] = ',';
     if (dm_pad_toggle_parse(longv)) FAIL("DM_TOUCH_TOGGLE longer than the limit is not ignored");
+    // What the in-game menu saves reads back as the same keys, in the engine's order, and skips what cannot toggle.
+    char out[128];
+    dm_pad_toggle_encode(1u << DM_PAD_C_ZR | 1u << DM_PAD_C_A | 1u << DM_PAD_C_STICK, out, sizeof out);
+    if (strcmp(out, "a,zr")) FAIL("DM_TOUCH_TOGGLE encoded as '%s'", out);
+    dm_pad_toggle_encode(0, out, sizeof out);
+    if (*out) FAIL("DM_TOUCH_TOGGLE of no key is not empty");
+    unsigned all = 0; for (int c = 0; c < DM_PAD_C_N; c++) if (dm_pad_toggleable(c)) all |= 1u << c;
+    dm_pad_toggle_encode(all, out, sizeof out);
+    if (dm_pad_toggle_parse(out) != all) FAIL("DM_TOUCH_TOGGLE '%s' does not read back", out);
 }
 
 // ---- DM_TOUCH_LAYOUT ----

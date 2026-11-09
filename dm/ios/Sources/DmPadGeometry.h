@@ -297,6 +297,16 @@ static inline unsigned dm_pad_toggle_parse(const char *_Nullable v) {   // the c
     }
     return mask;
 }
+// The value for a mask, names in dm_pad_control_names' order joined by commas ("" for none): what the in-game menu saves.
+static inline void dm_pad_toggle_encode(unsigned mask, char *_Nonnull out, size_t size) {
+    size_t n = 0;
+    if (size) out[0] = 0;
+    for (int c = 0; c < DM_PAD_C_N; c++) if ((mask & (1u << c)) && dm_pad_toggleable(c)) {
+        int w = snprintf(out + n, size - n, "%s%s", n ? "," : "", dm_pad_control_names[c]);
+        if (w < 0 || (size_t)w >= size - n) { out[n] = 0; return; }
+        n += (size_t)w;
+    }
+}
 
 // The drawn shapes (dm_pad_shapes ids) of a control.
 static inline BOOL dm_pad_is_shape_of(int id, int c) {

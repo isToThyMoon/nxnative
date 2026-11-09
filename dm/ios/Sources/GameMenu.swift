@@ -19,19 +19,36 @@ private func gameMenuItems() -> [UIMenuElement] {
         UIAction(title: names[l], state: dm_pad_layout() == l ? .on : .off) { _ in dm_pad_layout_set(Int32(l)) }
     }
     let layout = UIMenu(title: "Controller layout", options: .singleSelection, children: layouts)   // a choice's value shows in its submenu: a subtitle would make each row two lines
+    let controls: [UIMenuElement] = dm_pad_toggle_offered() ? [layout, keysThatToggle()] : [layout]
     var items: [UIMenuElement] = []
     var placed = false
     if let m = gameMenuModel {
         for section in m.sections {
-            var rows: [UIMenuElement] = section == "Controls" ? [layout] : []
+            var rows: [UIMenuElement] = section == "Controls" ? controls : []
             if section == "Controls" { placed = true }
             for s in m.rows(in: section) where (s.kind == "choice" || s.kind == "toggle") && dm_setting_live(s.env, nil) { rows.append(gameMenuRow(m, s)) }
             if !rows.isEmpty { items.append(UIMenu(options: .displayInline, children: rows)) }
         }
     }
-    if !placed { items.insert(UIMenu(options: .displayInline, children: [layout]), at: 0) }
+    if !placed { items.insert(UIMenu(options: .displayInline, children: controls), at: 0) }
     items.append(Unmanaged<UIMenu>.fromOpaque(dm_quit_menu()).takeRetainedValue())   // Quit <game>, last and on its own: it opens the quit prompt (front_ios.m)
     return items
+}
+
+// Keys that toggle (LNPANDY/NX2Apple#658), in a game's own app: a tap turns a checked key on, the next tap off. Several can be checked, one per
+// pick, and a pick applies at once and is kept for the next start (DmGamepad.m). The shell sets the same keys in its touch layout editor.
+// The numbers are DmPadGeometry.h's DM_PAD_C_* of the single keys.
+private let toggleKeys: [(control: Int32, name: String)] = [(1, "A"), (2, "B"), (3, "X"), (4, "Y"), (8, "L"), (10, "R"), (7, "ZL"), (9, "ZR"),
+                                                            (11, "L3"), (12, "R3"), (13, "−"), (14, "+")]
+
+private func keysThatToggle() -> UIMenuElement {
+    let on = toggleKeys.filter { dm_pad_toggles($0.control) }.map(\.name)
+    let keys = toggleKeys.map { key in
+        UIAction(title: key.name, state: dm_pad_toggles(key.control) ? .on : .off) { _ in
+            dm_pad_toggle_set(key.control, !dm_pad_toggles(key.control))
+        }
+    }
+    return UIMenu(title: "Keys that toggle", subtitle: on.isEmpty ? "None" : on.joined(separator: " "), children: keys)
 }
 
 private func gameMenuRow(_ m: LauncherModel, _ s: Setting) -> UIMenuElement {

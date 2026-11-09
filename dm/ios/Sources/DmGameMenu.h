@@ -10,6 +10,9 @@ void *dm_game_menu(void);   // GameMenu.swift: a retained UIMenu, rebuilt each t
 int dm_pad_layout(void);   // DmGamepad.m: 0 = 2D, 1 = 3D, 2 = Tap (DM_GAME_PAD_LAYOUT's numbers)
 bool dm_pad_layout_offered(int layout);   // Tap only in handheld mode
 void dm_pad_layout_set(int layout);   // releases every touch first, and is saved for the next start
+bool dm_pad_toggle_offered(void);   // DmGamepad.m: Keys that toggle is in the menu (a game's own app; the shell sets them in its layout editor)
+bool dm_pad_toggles(int control);   // the key (DmPadGeometry.h's DM_PAD_C_*) toggles
+void dm_pad_toggle_set(int control, bool on);   // at once, and saved for the next start as DM_TOUCH_TOGGLE
 void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
 bool dm_setting_live(const char *env, const char *value);
 void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
