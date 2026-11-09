@@ -126,11 +126,54 @@ static void test_bc4_single_channel(void) {
     check(out[1 + 4] == 255, "bc4 writes every row (not just the first)");
 }
 
+
+// ---- BC6H into RGB9E5 (DM_BC6H_RGB9E5): the same block through both paths, and the packing against an independent decode ----
+#include <math.h>
+static float ref_half(unsigned short h) {   // textbook half to float
+    int s = h >> 15, e = (h >> 10) & 31, m = h & 1023;
+    float v = e == 0 ? m / 1024.0f / 16384.0f : (1 + m / 1024.0f) * powf(2, (float)(e - 15));
+    return s ? -v : v;
+}
+static float ref_rgb9e5(unsigned v, int ch) { return (float)((v >> (9 * ch)) & 511) * powf(2, (float)((int)(v >> 27) - 24)); }
+static void test_rgb9e5_pack(void) {
+    unsigned one = nvn_rgb9e5_pack(1, 1, 1);
+    check(ref_rgb9e5(one, 0) == 1 && ref_rgb9e5(one, 1) == 1 && ref_rgb9e5(one, 2) == 1, "1.0 round-trips");
+    unsigned v = nvn_rgb9e5_pack(0.5f, 0.25f, 4.0f);
+    check(fabsf(ref_rgb9e5(v, 0) - 0.5f) < 0.5f / 256 && fabsf(ref_rgb9e5(v, 1) - 0.25f) < 0.25f / 256 && fabsf(ref_rgb9e5(v, 2) - 4.0f) < 4.0f / 256, "values round-trip inside the 9-bit mantissa");
+    check(nvn_rgb9e5_pack(-1, NAN, 0) == 0, "negative, NaN and zero pack as zero");
+    unsigned big = nvn_rgb9e5_pack(1e9f, 0, 0);
+    check(ref_rgb9e5(big, 0) <= 65408.0f && ref_rgb9e5(big, 0) > 65000.0f, "out-of-range clamps to the largest value");
+}
+static void test_bc6h_rgb9e5_switch(void) {
+    unsigned pf; int bpp;
+    unsigned char blk[16] = { 0x03, 0x20, 0x40, 0x61, 0x82, 0xA3, 0xC4, 0xE5, 0x16, 0x27, 0x38, 0x49, 0x5A, 0x6B, 0x7C, 0x8D };
+    unsigned short half[16 * 4]; unsigned wide[16];
+    nvn_bc_set_bc6h_rgb9e5(0);
+    check(nvn_bc_unpacked(0x50, &pf, &bpp) == 1 && pf == 115 && bpp == 8, "off: RGBA16Float, 8 bytes per pixel (the tested default)");
+    check(nvn_bc_decode(0x50, blk, 16, 4, 4, (unsigned char *)half, 4 * 8) == 0, "RGBA16F decode");
+    nvn_bc_set_bc6h_rgb9e5(1);
+    check(nvn_bc_bc6h_rgb9e5() == 1, "the switch reads back");
+    check(nvn_bc_unpacked(0x50, &pf, &bpp) == 1 && pf == 93 && bpp == 4, "on: RGB9E5Float, 4 bytes per pixel");
+    check(nvn_bc_unpacked(0x4f, &pf, &bpp) == 1 && pf == 93 && bpp == 4, "signed BC6H too");
+    check(nvn_bc_unpacked(0x41, &pf, &bpp) == 1 && pf == 70 && bpp == 4, "other BC formats are untouched");
+    check(nvn_bc_decode(0x50, blk, 16, 4, 4, (unsigned char *)wide, 4 * 4) == 0, "RGB9E5 decode");
+    for (int i = 0; i < 16; i++) {
+        unsigned want = nvn_rgb9e5_pack(ref_half(half[i * 4]), ref_half(half[i * 4 + 1]), ref_half(half[i * 4 + 2]));
+        check(wide[i] == want, "each pixel is the RGBA16F pixel packed as RGB9E5");
+    }
+    unsigned char edge[3 * 3 * 4 + 16]; memset(edge, 0xAB, sizeof edge);
+    check(nvn_bc_decode(0x50, blk, 16, 3, 3, edge, 3 * 4) == 0, "an edge block");
+    for (unsigned i = 3 * 3 * 4; i < sizeof edge; i++) check(edge[i] == 0xAB, "nothing is written past the trimmed block");
+    nvn_bc_set_bc6h_rgb9e5(0);
+}
+
 int main(void) {
     test_bc1_matches_reference();
     test_formats_map();
     test_edge_blocks_trimmed();
     test_bc4_single_channel();
+    test_rgb9e5_pack();
+    test_bc6h_rgb9e5_switch();
     if (failures) { printf("%d check(s) failed\n", failures); return 1; }
     printf("bc decode: BC1 matches an independent DXT1 decoder, format map, edge trimming, BC4 - all OK\n");
     return 0;
