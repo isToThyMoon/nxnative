@@ -33,6 +33,22 @@ static void check_fits(const Screen *s, BOOL full, const char *size, DmPadOption
     }
 }
 
+// ---- DM_TOUCH_TOGGLE ----
+
+// The keys that toggle: single keys by name, the diamond, the sticks, the D-pad and unknown names skipped.
+static void check_toggle_values(void) {
+    if (dm_pad_toggle_parse(NULL) || dm_pad_toggle_parse("")) FAIL("DM_TOUCH_TOGGLE unset or empty: every key is held");
+    unsigned m = dm_pad_toggle_parse("zl,zr,a");
+    if (m != (1u << DM_PAD_C_ZL | 1u << DM_PAD_C_ZR | 1u << DM_PAD_C_A)) FAIL("DM_TOUCH_TOGGLE zl,zr,a: read as %#x", m);
+    m = dm_pad_toggle_parse("face,stick,dpad,home,,b,");
+    if (m != 1u << DM_PAD_C_B) FAIL("DM_TOUCH_TOGGLE: the diamond, the stick, the D-pad or an unknown name is not skipped (%#x)", m);
+    m = dm_pad_toggle_parse("a,b,x,y,zl,l,zr,r,l3,r3,minus,plus");
+    for (int c = 0; c < DM_PAD_C_N; c++) if (!!(m & (1u << c)) != dm_pad_toggleable(c)) FAIL("DM_TOUCH_TOGGLE: %s", dm_pad_control_names[c]);
+    char longv[DM_PAD_LAYOUT_MAX + 8]; memset(longv, 'a', sizeof longv - 1); longv[sizeof longv - 1] = 0;
+    for (size_t i = 1; i < sizeof longv - 1; i += 2) longv[i] = ',';
+    if (dm_pad_toggle_parse(longv)) FAIL("DM_TOUCH_TOGGLE longer than the limit is not ignored");
+}
+
 // ---- DM_TOUCH_LAYOUT ----
 
 static int g_arranged;
@@ -354,6 +370,7 @@ int main(void) {
             }
 
     check_layout_values();
+    check_toggle_values();
     check_arrangement(screens, nscreens);
     check_duo_outer_custom_bounds();
 

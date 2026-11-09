@@ -277,6 +277,27 @@ static inline int dm_pad_layout_count(const DmPadLayout *l) {   // the moved con
     return n;
 }
 
+// ---- Keys that toggle (DM_TOUCH_TOGGLE) ----
+// The keys the player set to Toggle in the shell's layout editor, as dm_pad_control_names joined by commas, for example zl,zr,a. A tap
+// on such a key turns it on and the next tap turns it off, so a long hold (running, accelerating) needs no finger on the screen. Only
+// single keys toggle: the diamond as a whole, the left stick and the D-pad are skipped, so is an unknown name (a newer shell). Unset,
+// empty or a value longer than DM_PAD_LAYOUT_MAX: every key is held as before.
+static inline BOOL dm_pad_toggleable(int c) {
+    return (c >= DM_PAD_C_A && c <= DM_PAD_C_Y) || (c >= DM_PAD_C_ZL && c <= DM_PAD_C_PLUS);
+}
+static inline unsigned dm_pad_toggle_parse(const char *_Nullable v) {   // the controls (1 << DM_PAD_C_*) that toggle
+    if (!v || !*v || strnlen(v, DM_PAD_LAYOUT_MAX + 1) > DM_PAD_LAYOUT_MAX) return 0;
+    unsigned mask = 0;
+    for (const char *p = v; *p; ) {
+        const char *name = p;
+        while (*p && *p != ',') p++;
+        int c = dm_pad_name_index(name, (size_t)(p - name), dm_pad_control_names, DM_PAD_C_N);
+        if (c >= 0 && dm_pad_toggleable(c)) mask |= 1u << c;
+        if (*p == ',') p++;
+    }
+    return mask;
+}
+
 // The drawn shapes (dm_pad_shapes ids) of a control.
 static inline BOOL dm_pad_is_shape_of(int id, int c) {
     switch (c) {
