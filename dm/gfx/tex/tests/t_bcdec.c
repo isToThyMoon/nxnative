@@ -167,6 +167,27 @@ static void test_bc6h_rgb9e5_switch(void) {
     nvn_bc_set_bc6h_rgb9e5(0);
 }
 
+__attribute__((noinline))
+static void decode_edge_with_odd_stack(int pad_byte, uint32_t fmt, const unsigned char *blk, int bpp) {
+    volatile char odd[3] = { (char)pad_byte, 1, 2 };
+    (void)odd;
+    _Alignas(8) unsigned char dst[3 * 3 * 8];
+    memset(dst, 0xCD, sizeof dst);
+    check(nvn_bc_decode(fmt, blk, fmt == 0x41 ? 8 : 16, 3, 3, dst, (size_t)(3 * bpp)) == 0, "edge decode stays aligned across stack layouts");
+}
+
+static void test_edge_tmp_alignment(void) {
+    unsigned char blk8[8] = { 0x00, 0xf8, 0xe0, 0x07, 0xaa, 0x55, 0x00, 0xff };
+    unsigned char blk16[16] = { 0x03, 0x20, 0x40, 0x61, 0x82, 0xA3, 0xC4, 0xE5, 0x16, 0x27, 0x38, 0x49, 0x5A, 0x6B, 0x7C, 0x8D };
+    nvn_bc_set_bc6h_rgb9e5(0);
+    decode_edge_with_odd_stack(7, 0x41, blk8, 4);
+    decode_edge_with_odd_stack(7, 0x4d, blk16, 4);
+    decode_edge_with_odd_stack(7, 0x50, blk16, 8);
+    nvn_bc_set_bc6h_rgb9e5(1);
+    decode_edge_with_odd_stack(7, 0x50, blk16, 4);
+    nvn_bc_set_bc6h_rgb9e5(0);
+}
+
 int main(void) {
     test_bc1_matches_reference();
     test_formats_map();
@@ -174,6 +195,7 @@ int main(void) {
     test_bc4_single_channel();
     test_rgb9e5_pack();
     test_bc6h_rgb9e5_switch();
+    test_edge_tmp_alignment();
     if (failures) { printf("%d check(s) failed\n", failures); return 1; }
     printf("bc decode: BC1 matches an independent DXT1 decoder, format map, edge trimming, BC4 - all OK\n");
     return 0;

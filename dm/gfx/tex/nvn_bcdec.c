@@ -75,7 +75,7 @@ static void block(uint32_t f, const uint8_t *b, uint8_t *o, int op) {   // 一�
 int nvn_bc_decode(uint32_t f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint8_t *dst, size_t dpitch) {
     uint32_t pf; int bpp; if (!nvn_bc_unpacked(f, &pf, &bpp)) return -1;
     int bb = (f == 0x41 || f == 0x42 || f == 0x45 || f == 0x46 || f == 0x49 || f == 0x4a) ? 8 : 16;   // 每块字节 | bytes per block
-    uint8_t tmp[4 * 4 * 8];
+    _Alignas(8) uint8_t tmp[4 * 4 * 8];
     for (uint32_t by = 0; by * 4 < h; by++) for (uint32_t bx = 0; bx * 4 < w; bx++) {
         const uint8_t *b = src + by * pitch + bx * bb;
         uint32_t cw = w - bx * 4 < 4 ? w - bx * 4 : 4, ch = h - by * 4 < 4 ? h - by * 4 : 4;
