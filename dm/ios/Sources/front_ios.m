@@ -88,6 +88,10 @@ static void tv_attach(void);
 }
 @end
 
+@interface DmTVSceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property (strong, nonatomic) UIWindow *window;
+@end
+
 @interface DmRootVC : UIViewController
 @property (nonatomic, strong) DmGameView *game;
 @property (nonatomic, strong) UIView *pad;
@@ -137,7 +141,7 @@ static void launcher_done(void) { [g_root startGame]; }
 #if defined(__IPHONE_27_0)   // compiled only with an SDK that has the scene accessory API
     if (@available(iOS 27.0, *)) {   // iOS 27 offers a TV scene only to a registered scene accessory, no longer from the Info.plist entry alone (that path stays for iOS 26)
         UISceneConfiguration *c = [[UISceneConfiguration alloc] initWithName:@"TV" sessionRole:UIWindowSceneSessionRoleExternalDisplayNonInteractive];
-        c.delegateClass = NSClassFromString(@"DmTVSceneDelegate");
+        c.delegateClass = DmTVSceneDelegate.class;
         self.tv = [self registerSceneAccessory:[UISceneAccessory externalNonInteractiveSceneAccessoryWithConfiguration:c]];
     }
 #endif
@@ -316,9 +320,6 @@ bool dm_setting_live(const char *env, const char *value) {
     if (!strcmp(env, "DM_RUMBLE")) { if (value) { dm_haptics_set_enabled(atoi(value) != 0); LOG("front end: game rumble %s (in-game menu)", atoi(value) ? "on" : "off"); } return true; }
     return false;
 }
-@interface DmTVSceneDelegate : UIResponder <UIWindowSceneDelegate>
-@property (strong, nonatomic) UIWindow *window;
-@end
 @implementation DmTVSceneDelegate
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)o {
     self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
