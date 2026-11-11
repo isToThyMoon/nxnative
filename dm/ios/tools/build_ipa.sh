@@ -272,6 +272,7 @@ if [ -n "$FRAMEWORK_ONLY" ]; then
   BUILT=$DD/Build/Products/Release-iphoneos/$FW_NAME.framework
   [ -f "$BUILT/$FW_NAME" ] || die "no built framework $BUILT"
   OUTFW=$FRAMEWORK_ONLY/$FW_NAME.framework; mkdir -p "$OUTFW"
+  t "copying resources into $FW_NAME.framework"
   rsync -a --delete --exclude /msl --exclude /pso --exclude /icon.png -- "$BUILT/" "$OUTFW/" || die "copy the framework to $OUTFW"
   # An NVN game's libraries may be the one file b-<chain>.img (dm/tools/shader_lib.py): it goes in as msl/<MSLDIR>.img, where the host reads it (nvn_mtl.m), as stage_resources.sh copies it into an app
   LIB=$(lib_path "$MSL_IOS/$MSLDIR") || die "shader libraries $MSL_IOS/$MSLDIR"
