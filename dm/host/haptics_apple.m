@@ -429,7 +429,20 @@ static void configure(int p, GCController *controller, GCHapticsLocality localit
                 channels[p] = [NSMutableArray new];
                 GCHapticsLocality both = [localities containsObject:GCHapticsLocalityHandles] ? GCHapticsLocalityHandles : GCHapticsLocalityDefault;
                 add_engine(p, -1, @"controller handles", ^CHHapticEngine *(NSError **e) { (void)e; return [h createEngineWithLocality:both]; });
-                channels[p].lastObject.simple = YES;
+                DmRumbleChannel *m = channels[p].lastObject;
+                m.simple = YES;
+                if (![both isEqualToString:GCHapticsLocalityDefault]) {
+                    __weak NSArray *merged = channels[p];
+                    m.fallback = ^(NSTimeInterval retryAfter) {
+                        if (!merged || channels[p] != merged) return;
+                        for (DmRumbleChannel *old in channels[p]) [old stop];
+                        channels[p] = [NSMutableArray new];
+                        default_controller(p, h, retryAfter);
+                        channels[p].lastObject.simple = YES;
+                        dm_haptics_route(p, 1);
+                        fprintf(stderr, "haptics: player %d retrying with the default controller locality\n", p + 1);
+                    };
+                }
                 dm_haptics_route(p, 1);
                 fprintf(stderr, "haptics: player %d plays both motors on one engine (%s)\n", p + 1, both.UTF8String);
             };
@@ -532,6 +545,10 @@ void dm_haptics_apple_teardown(void) {
         }
         queue = nil;
     }
+    dm_haptics_init(NULL, 0);
+    gain = 1;
+    rumble_min = 0;
+    errors = 0;
     g_haptics_inited = 0;
     pthread_mutex_unlock(&routeLock);
 }
@@ -542,12 +559,15 @@ void dm_haptics_apple_init(void) {
         return;
     }
     g_haptics_inited = 1;
+    gain = 1;
+    rumble_min = 0;
+    errors = 0;
     queue = dispatch_queue_create("dm.rumble", DISPATCH_QUEUE_SERIAL);
     dispatch_queue_set_specific(queue, &queue, &queue, NULL);
-    const char *e = getenv("DM_RUMBLE_GAIN");
-    if (e) { float v = strtof(e, NULL); if (isfinite(v)) gain = fmaxf(0, fminf(3, v)); }
-    e = getenv("DM_RUMBLE_MIN");
-    if (e) { float v = strtof(e, NULL); if (isfinite(v)) rumble_min = fmaxf(0, fminf(0.9f, v)); }
+    const char *e = getenv("DM_RUMBLE_GAIN"); char *end = NULL;
+    if (e && *e) { float v = strtof(e, &end); if (end != e && !*end && isfinite(v)) gain = fmaxf(0, fminf(3, v)); }
+    e = getenv("DM_RUMBLE_MIN"); end = NULL;
+    if (e && *e) { float v = strtof(e, &end); if (end != e && !*end && isfinite(v)) rumble_min = fmaxf(0, fminf(0.9f, v)); }
     e = getenv("DM_RUMBLE");
     dm_haptics_init(apply, !e || atoi(e) != 0);
 #if TARGET_OS_IPHONE
