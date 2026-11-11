@@ -390,15 +390,19 @@ static int atrace_fault(void *addr, int is_write, void *uc_) {
     }
     return 0;
 }
+#endif
 void probe_atrace(uint64_t lo, uint64_t n) {
+#if !TARGET_OS_IPHONE
     static int hooked; if (!hooked) { hooked = 1; dm_fault_hook_register(atrace_fault); }
     int i = atomic_load(&g_atn); if (i >= 64 || !n) { LOG("atrace: 64 ranges at most"); return; }
     uint64_t pg = (uint64_t)getpagesize(); lo &= ~(pg - 1); n = (n + pg - 1) & ~(pg - 1);
     g_at[i].lo = lo; g_at[i].hi = lo + n; atomic_store(&g_atn, i + 1);
     int r = mprotect((void *)(uintptr_t)lo, n, PROT_NONE);
     LOG("DM_CTL: atrace range %d %#llx + %#llx armed%s", i, (unsigned long long)lo, (unsigned long long)n, r ? " (mprotect failed)" : "");
-}
+#else
+    (void)lo; (void)n;
 #endif
+}
 void probe_install(void) {
 #if !TARGET_OS_IPHONE
     crash_set_trap_hook(probe_hit);
