@@ -15,24 +15,12 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include "SegSnap.h"
 #include "ShellEngine.h"
 #include "ShellGlue.h"
 #import "DmShell-Swift.h"
 
 extern char **environ;
-
-typedef struct {
-    uint8_t *data_ptr;
-    uint8_t *data_snap;
-    size_t data_sz;
-    uint8_t *common_ptr;
-    uint8_t *common_snap;
-    size_t common_sz;
-    uint8_t *bss_ptr;
-    size_t bss_sz;
-    struct { size_t off; uint64_t val; } *bss_nz;
-    size_t bss_nnz;
-} DmSegSnap;
 
 typedef struct {
     const void *fbase;
@@ -72,76 +60,6 @@ static void clear_game_env(void) {
     for (int i = 0; i < count; i++) unsetenv(names[i]);
 }
 
-static void save_seg_snap(const struct mach_header_64 *mh, const char *segname, DmSegSnap *s) {
-    unsigned long dsz = 0, csz = 0, bsz = 0;
-    s->data_ptr = getsectiondata(mh, segname, "__data", &dsz); s->data_sz = dsz;
-    s->common_ptr = getsectiondata(mh, segname, "__common", &csz); s->common_sz = csz;
-    s->bss_ptr = getsectiondata(mh, segname, "__bss", &bsz); s->bss_sz = bsz;
-    if (s->data_ptr && s->data_sz) {
-        s->data_snap = malloc(s->data_sz);
-        if (s->data_snap) memcpy(s->data_snap, s->data_ptr, s->data_sz);
-    }
-    if (s->common_ptr && s->common_sz) {
-        s->common_snap = malloc(s->common_sz);
-        if (s->common_snap) memcpy(s->common_snap, s->common_ptr, s->common_sz);
-    }
-    if (s->bss_ptr && s->bss_sz) {
-        size_t pg = (size_t)getpagesize();
-        uintptr_t b0 = (uintptr_t)s->bss_ptr;
-        uintptr_t b1 = b0 + s->bss_sz;
-        uintptr_t p0 = b0 & ~(pg - 1);
-        uintptr_t p1 = (b1 + pg - 1) & ~(pg - 1);
-        size_t np = (p1 - p0) / pg;
-        char *vec = np ? malloc(np) : NULL;
-        int mc_ok = vec && mincore((const void *)p0, p1 - p0, vec) == 0;
-        size_t cap = 0;
-        for (size_t p = 0; p < np; p++) {
-            if (mc_ok && !(vec[p] & (MINCORE_INCORE | MINCORE_PAGED_OUT))) continue;
-            uintptr_t a0 = p0 + p * pg;
-            uintptr_t a1 = a0 + pg;
-            if (a0 < b0) a0 = (b0 + 7ULL) & ~7ULL;
-            if (a1 > b1) a1 = b1;
-            for (uintptr_t a = a0; a + 8 <= a1; a += 8) {
-                uint64_t v = *(const uint64_t *)a;
-                if (!v) continue;
-                if (s->bss_nnz == cap) {
-                    size_t ncap = cap ? cap * 2 : 64;
-                    void *nb = realloc(s->bss_nz, ncap * sizeof s->bss_nz[0]);
-                    if (!nb) break;
-                    s->bss_nz = nb; cap = ncap;
-                }
-                s->bss_nz[s->bss_nnz].off = (size_t)(a - b0);
-                s->bss_nz[s->bss_nnz].val = v;
-                s->bss_nnz++;
-            }
-        }
-        free(vec);
-    }
-}
-
-static void restore_seg_snap(const DmSegSnap *s) {
-    if (s->data_ptr && s->data_snap && s->data_sz) memcpy(s->data_ptr, s->data_snap, s->data_sz);
-    if (s->common_ptr && s->common_snap && s->common_sz) memcpy(s->common_ptr, s->common_snap, s->common_sz);
-    if (s->bss_ptr && s->bss_sz) {
-        size_t pg = (size_t)getpagesize();
-        uintptr_t b0 = (uintptr_t)s->bss_ptr;
-        uintptr_t b1 = b0 + s->bss_sz;
-        uintptr_t p0 = (b0 + pg - 1) & ~(pg - 1);
-        uintptr_t p1 = b1 & ~(pg - 1);
-        if (p1 > p0) {
-            if (p0 > b0) memset((void *)b0, 0, p0 - b0);
-            if (mmap((void *)p0, p1 - p0, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0) == MAP_FAILED)
-                memset((void *)p0, 0, p1 - p0);
-            if (b1 > p1) memset((void *)p1, 0, b1 - p1);
-        } else {
-            memset(s->bss_ptr, 0, s->bss_sz);
-        }
-        for (size_t i = 0; i < s->bss_nnz; i++) {
-            *(uint64_t *)(s->bss_ptr + s->bss_nz[i].off) = s->bss_nz[i].val;
-        }
-    }
-}
-
 static void save_framework_data(const void *fbase) {
     if (!fbase) return;
     for (int i = 0; i < g_nfw_snaps; i++) if (g_fw_snaps[i].fbase == fbase) return;
@@ -150,8 +68,8 @@ static void save_framework_data(const void *fbase) {
     DmFwSnap *s = &g_fw_snaps[g_nfw_snaps++];
     memset(s, 0, sizeof *s);
     s->fbase = fbase;
-    save_seg_snap(mh, "__DATA", &s->seg[0]);
-    save_seg_snap(mh, "__DATA_DIRTY", &s->seg[1]);
+    dm_seg_snap_save(mh, "__DATA", &s->seg[0]);
+    dm_seg_snap_save(mh, "__DATA_DIRTY", &s->seg[1]);
     fprintf(stderr, "shell: saved framework state for %p (__data=%#zx, __common=%#zx, __bss=%#zx with %zu initial non-zero words)\n",
             fbase, s->seg[0].data_sz + s->seg[1].data_sz, s->seg[0].common_sz + s->seg[1].common_sz,
             s->seg[0].bss_sz + s->seg[1].bss_sz, s->seg[0].bss_nnz + s->seg[1].bss_nnz);
@@ -162,8 +80,8 @@ static void restore_framework_data(const void *fbase) {
     DmFwSnap *s = NULL;
     for (int i = 0; i < g_nfw_snaps; i++) if (g_fw_snaps[i].fbase == fbase) { s = &g_fw_snaps[i]; break; }
     if (!s) return;
-    restore_seg_snap(&s->seg[0]);
-    restore_seg_snap(&s->seg[1]);
+    dm_seg_snap_restore(&s->seg[0]);
+    dm_seg_snap_restore(&s->seg[1]);
     fprintf(stderr, "shell: restored framework state for %p\n", fbase);
 }
 

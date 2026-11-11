@@ -84,6 +84,7 @@ run: $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_to
 	$(B)/t_pad_motion
 	$(B)/t_controllers_mac
 	$(B)/t_stick_deadzone
+	$(B)/t_seg_snap
 run: $(B)/t_nro
 run: $(B)/t_sync_wait
 $(B)/t_sync_wait: t_sync_wait.c t_condvar_stub.c ../hle_thread.c ../dm.h $(GAME_H) ../hle_profile.c ../hle_profile.h | $(B)
@@ -430,7 +431,9 @@ $(B)/t_profile_runtime: t_profile_runtime.c ../hle_profile.c ../hle_profile.h ..
 profile-runtime: $(B)/t_profile_runtime
 	TMPDIR="$(abspath $(B))" $(B)/t_profile_runtime
 
-run: $(B)/t_pad_map $(B)/t_pad_motion $(B)/t_controllers_mac $(B)/t_stick_deadzone
+run: $(B)/t_pad_map $(B)/t_pad_motion $(B)/t_controllers_mac $(B)/t_stick_deadzone $(B)/t_seg_snap
+$(B)/t_seg_snap: t_seg_snap.c ../../ios/Shell/SegSnap.h | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -fsanitize=address,undefined -I../../ios/Shell -o $@ t_seg_snap.c
 $(B)/t_stick_deadzone: t_stick_deadzone.c ../stick_deadzone.h ../hle_hid.c ../motion_fusion.h ../hle_haptics.c ../hle_haptics.h ../dm_input.h ../hle.h ../dm.h $(GAME_H) | $(B)
 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_stick_deadzone.c ../hle_haptics.c
 $(B)/t_pad_motion: t_pad_motion.c ../pad_motion.h ../dm_input.h | $(B)
