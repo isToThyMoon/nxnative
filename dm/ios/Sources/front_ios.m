@@ -690,6 +690,8 @@ static void front_ios_teardown(void) {
     [g_fps_timer invalidate]; g_fps_timer = nil;
     [g_hq_timer invalidate]; g_hq_timer = nil;
     for (int i = 0; i < 5; i++) if (g_obs[i]) { [NSNotificationCenter.defaultCenter removeObserver:g_obs[i]]; g_obs[i] = nil; }
+    g_audio_bg = g_audio_intr = g_session_off = 0;
+    [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
     if (g_notify_delegate) {
         UNUserNotificationCenter.currentNotificationCenter.delegate = nil;
         g_notify_delegate = nil;
