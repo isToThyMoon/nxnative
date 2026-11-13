@@ -2448,7 +2448,10 @@ static void gpu_fill_frame(uint64_t f) {
         // runs in bursts of 45 frames at most, each followed by a rest half again as long (40% of the frames at most): a GPU kept full longer makes the system lower the
         // CPU clock (4.0 -> 1.4 GHz at 85% of the frames filled, submit 4.5 -> 12 ms: the game was then late on the CPU), as it does for a game it takes to be GPU-bound
         static double W; static uint64_t off_since, rest_until; (void)hi; (void)lo;
-        if (!state && !calib && r > 0 && f > off_since + 10) { double g = mtl_gpu_ms(seen); if (g > 0) { double w = g / r; W = W > 0 ? W + 0.1 * (w - W) : w; } }
+        // W is taken only while the clock stands still (the last three probes within 15% of each other, 40 frames after a fill): a GPU time from before the clock
+        // moved, divided by the level after it, gave three times the work (10.8 ms where the scene has 3.7)
+        { uint32_t pmx = p0 > p1 ? p0 : p1; if (p2 > pmx) pmx = p2;
+          if (!state && !calib && r > 0 && est && p0 && p1 && p2 && pmx * 100 <= est * 115 && f > off_since + 40) { double g = mtl_gpu_ms(seen); if (g > 0) { double w = g / r; W = W > 0 ? W + 0.1 * (w - W) : w; } } }
         double want = W > 0 ? 10.0 / W : 99; if (want < 1.0) want = 1.0;
         if (!state) { if (!calib && r > 0 && W > 0 && f >= rest_until && r > want * 1.08 && r >= 1.15) { state = 1; run = 0; kicks++; } }
         else { filled++; run++;
