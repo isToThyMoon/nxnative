@@ -1331,12 +1331,20 @@ static int pend_room(int nodes) {
 // (Fire Emblem Engage writes its query reports into the page of a uniform block); for later submissions it counts by its own 16 bytes while this one runs (hw_note, hw_live).
 // A GPU write over more than SBW_WPAGES pages is kept as an interval instead (overlapping ones merge): a storage buffer bound with size 0 counts as the rest of its Metal buffer (sbw_len)
 enum { SBW_N = 16384, SBW_WPAGES = 64, SBW_WN = 64 };
-static struct { uint64_t page; uint32_t gen; uint8_t src; } g_sbwp[SBW_N]; static int g_nsbw, g_sbw_over;   // src: SBW_* bits; pages in the set this submission; over: a write could not be kept (set full, size not known)
+// The 64-byte cells of page pg that [lo, hi) meets, as a bit each. GPU writes are kept by cell, not by whole 4 KB page: Breath of the Wild's particle dispatches write
+// storage buffers of 16 to 1,040 bytes that share their pages with uniform blocks, and by page every such block counted as written by the GPU (about 1,850 copies refused a
+// frame; with frame ahead each is then read in place and a later write to its page waits for the GPU)
+static inline uint64_t cell_mask(uint64_t lo, uint64_t hi, uint64_t pg) {
+    uint64_t a = lo > pg << 12 ? lo : pg << 12, b = hi < (pg + 1) << 12 ? hi : (pg + 1) << 12; if (b <= a) return 0;
+    unsigned x = (unsigned)(a & 4095) >> 6, y = (unsigned)((b - 1) & 4095) >> 6;
+    return (y - x == 63 ? ~0ull : ((1ull << (y - x + 1)) - 1)) << x;
+}
+static struct { uint64_t page, cells; uint32_t gen; uint8_t src; } g_sbwp[SBW_N]; static int g_nsbw, g_sbw_over;   // src: SBW_* bits; pages in the set this submission; over: a write could not be kept (set full, size not known)
 static uint64_t g_sbw_wlo[SBW_WN], g_sbw_whi[SBW_WN]; static int g_nsbw_w;   // the wide writes of this submission
 static int sbw_slot(uint64_t pg, int add) {   // open addressing; −1 = not there (or no room to add)
     unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 50) & (SBW_N - 1);
     for (int i = 0; i < 64; i++, h = (h + 1) & (SBW_N - 1)) {
-        if (g_sbwp[h].gen != g_pend_gen) { if (!add) return -1; g_sbwp[h].page = pg; g_sbwp[h].gen = g_pend_gen; g_sbwp[h].src = 0; g_nsbw++; return (int)h; }
+        if (g_sbwp[h].gen != g_pend_gen) { if (!add) return -1; g_sbwp[h].page = pg; g_sbwp[h].gen = g_pend_gen; g_sbwp[h].src = 0; g_sbwp[h].cells = 0; g_nsbw++; return (int)h; }
         if (g_sbwp[h].page == pg) return (int)h; }
     return -1;
 }
@@ -1355,12 +1363,13 @@ static void sbw_note(uint64_t lo, uint64_t n, int src) {
         if (g_nsbw_w == SBW_WN) { g_sbw_over = 1; return; }
         g_sbw_wlo[g_nsbw_w] = lo; g_sbw_whi[g_nsbw_w++] = hi; return;
     }
-    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { int k = sbw_slot(pg, 1); if (k < 0) { g_sbw_over = 1; return; } g_sbwp[k].src |= (uint8_t)src; }
+    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { int k = sbw_slot(pg, 1); if (k < 0) { g_sbw_over = 1; return; } g_sbwp[k].src |= (uint8_t)src; if (src == SBW_GPU) g_sbwp[k].cells |= cell_mask(lo, hi, pg); }
 }
+static uint64_t g_sbw_hit_wide, g_sbw_hit_cell, g_sbw_wide_bytes;   // what answered sbw_hits (the [ahead] line)
 static int sbw_hits(uint64_t lo, uint64_t hi) {
-    for (int i = 0; i < g_nsbw_w; i++) if (lo < g_sbw_whi[i] && g_sbw_wlo[i] < hi) return 1;
+    for (int i = 0; i < g_nsbw_w; i++) if (lo < g_sbw_whi[i] && g_sbw_wlo[i] < hi) { g_sbw_hit_wide++; g_sbw_wide_bytes = g_sbw_whi[i] - g_sbw_wlo[i]; return 1; }
     if (!g_nsbw) return 0;
-    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { int k = sbw_slot(pg, 0); if (k >= 0 && (g_sbwp[k].src & SBW_GPU)) return 1; }
+    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { int k = sbw_slot(pg, 0); if (k >= 0 && (g_sbwp[k].src & SBW_GPU) && (g_sbwp[k].cells & cell_mask(lo, hi, pg))) { g_sbw_hit_cell++; return 1; } }
     return 0;
 }
 // The bytes a writable storage binding at Metal buffer offset mo can write: its size, else (bound with size 0, as Breath of the Wild's GPU particle dispatches bind their outputs, or a
@@ -1918,7 +1927,7 @@ static void ubd_read(uint64_t lo, size_t n, void *out) {
 // DM_NVN_UB_PARTIAL=0 turns it off
 static int ub_partial_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_UB_PARTIAL"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_UB_PARTIAL=0: a binding the deferred uniform updates cover only in part ends the pass as before"); } return v; }
 enum { GW_N = 1 << 16, GW_PAGES = 4096 };   // full at 4,096 (Ocarina of Time), every slot then a false hit for some page: 35 passes a frame ended over a block no GPU write touched
-typedef struct { uint64_t page, fence; } gw_ent;
+typedef struct { uint64_t page, fence, cells; } gw_ent;   // cells: the 64-byte cells of the page its running writes meet (cell_mask); all of them for a slot two pages share
 static gw_ent g_gw[GW_N];   // page ~0: two live pages met in the slot, so any page there counts as written until fence completes
 static gw_ent g_gwx[GW_N];  // the same without the inline updates the host remembers (um_ent): what a uniform shadow cannot read from memory
 static uint64_t g_gw_all;                            // every page counts as written until this fence completes (a submission whose writes could not all be listed)
@@ -1935,20 +1944,25 @@ static void gww_put(uint64_t lo, uint64_t hi, uint64_t fence, uint64_t done) {
     if (free_slot >= 0) { g_gww[free_slot].lo = lo; g_gww[free_slot].hi = hi; g_gww[free_slot].fence = fence; }
     else if (fence > g_gw_all) g_gw_all = fence;
 }
+static void gw_put_cells(gw_ent *t, uint64_t pg, uint64_t cells, uint64_t fence, uint64_t done) {
+    unsigned s = gw_slot(pg); int fin = t[s].fence <= done;
+    if (t[s].page == pg) { if (fin) t[s].cells = 0; }   // what was written there has finished
+    else if (fin) { t[s].page = pg; t[s].cells = 0; }
+    else { t[s].page = ~0ull; t[s].cells = ~0ull; }   // two pages with running writes share the slot: either counts as written whole
+    t[s].cells |= cells; if (fence > t[s].fence) t[s].fence = fence;
+}
 static void gw_put_in(gw_ent *t, uint64_t lo, uint64_t hi, uint64_t fence, uint64_t done) {
     if (hi <= lo) return;
     uint64_t p0 = lo >> 12, p1 = (hi - 1) >> 12;
     if (p1 - p0 >= GW_PAGES) { gww_put(lo, hi, fence, done); return; }
-    for (uint64_t pg = p0; pg <= p1; pg++) { unsigned s = gw_slot(pg);
-        t[s].page = t[s].page == pg || t[s].fence <= done ? pg : ~0ull;
-        if (fence > t[s].fence) t[s].fence = fence; }
+    for (uint64_t pg = p0; pg <= p1; pg++) gw_put_cells(t, pg, cell_mask(lo, hi, pg), fence, done);
 }
 static void gw_put(uint64_t lo, uint64_t hi, uint64_t fence, uint64_t done) { gw_put_in(g_gw, lo, hi, fence, done); gw_put_in(g_gwx, lo, hi, fence, done); }
 static int gw_live_in(const gw_ent *t, uint64_t lo, uint64_t hi) {
     uint64_t done = g_done;   // read without the lock as elsewhere: a stale value only refuses more
     if (g_gw_all > done) return 1;
     for (int i = 0; i < GWW_N; i++) if (g_gww[i].fence > done && lo < g_gww[i].hi && g_gww[i].lo < hi) return 1;
-    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { unsigned s = gw_slot(pg); if ((t[s].page == pg || t[s].page == ~0ull) && t[s].fence > done) return 1; }
+    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { unsigned s = gw_slot(pg); if ((t[s].page == pg || t[s].page == ~0ull) && t[s].fence > done && (t[s].cells & cell_mask(lo, hi, pg))) return 1; }
     return 0;
 }
 // The records the host writes into guest memory when a submission completes (post_run): counter reports and samples-passed results, 16 bytes each. Until then memory holds what was there
@@ -1999,7 +2013,7 @@ static void gw_commit(uint64_t fence) {
         gw_put_in(g_gw, g_pend_lo[e], g_pend_hi[e], fence, done);
         if (g_pend_kind[e] == 1 && g_pend_upd[e] && um_on()) { const upd_ent *u = &g_upd[g_pend_upd[e] - 1]; um_put(g_pend_lo[e], g_pend_hi[e], (const uint8_t *)u->buf.contents + u->off + (g_pend_lo[e] - u->lo), fence, done); }
         else gw_put_in(g_gwx, g_pend_lo[e], g_pend_hi[e], fence, done); }
-    if (g_nsbw) for (int i = 0; i < SBW_N; i++) if (g_sbwp[i].gen == g_pend_gen && (g_sbwp[i].src & SBW_GPU)) gw_put(g_sbwp[i].page << 12, (g_sbwp[i].page + 1) << 12, fence, done);   // reports: below
+    if (g_nsbw) for (int i = 0; i < SBW_N; i++) if (g_sbwp[i].gen == g_pend_gen && (g_sbwp[i].src & SBW_GPU)) { gw_put_cells(g_gw, g_sbwp[i].page, g_sbwp[i].cells, fence, done); gw_put_cells(g_gwx, g_sbwp[i].page, g_sbwp[i].cells, fence, done); }   // reports: below
     for (int i = 0; i < g_nsbw_w; i++) gw_put(g_sbw_wlo[i], g_sbw_whi[i], fence, done);
     int ring = g_nhw_sub <= HW_N && (!g_nhw_sub || g_hwr[(g_nhwr + (uint64_t)g_nhw_sub - 1) % HW_N].fence <= done);   // the slots they take have finished (the farthest is the newest of them)
     for (int i = 0; i < g_nhw_sub; i++) { uint64_t a = g_hw_sub[i];
@@ -2069,6 +2083,7 @@ typedef struct { uint64_t lo, hi, gpu; uint8_t *cpu; int npend; uint32_t gen, sb
 static uint64_t g_ubp_ready;   // ready of the shadow ubp_get returned last (a CPU read of it waits for that: ubc_wait)
 static ubp_ent g_ubpc[UBP_CACHE]; static unsigned g_ubpc_i;
 // The bytes [lo, hi) as the GPU will read them at this point of the submission (see above): 1 with the shadow's GPU and CPU addresses, 0 when they cannot be known (the pass ends instead)
+static int g_ubp_sync;   // set around a call: copy memory now, not on the copy worker (frame ahead: the game may write the block again once this submission is encoded)
 static int ubp_get(uint64_t lo, uint64_t hi, uint64_t *gpu, const uint8_t **cpu) {
     if (!ub_partial_on() || hi <= lo || hi - lo > UBP_MAX_BYTES) { g_ubp_why[0]++; return 0; }
     ubp_ent *c = NULL;
@@ -2097,7 +2112,7 @@ static int ubp_get(uint64_t lo, uint64_t hi, uint64_t *gpu, const uint8_t **cpu)
                    if (nc == 1 && cl[0] == lo && ch[0] == hi) break; } } }
     uint64_t len = hi - lo;
     id<MTLBuffer> ab; size_t o = arena_alloc((size_t)len, &ab); uint8_t *d = (uint8_t *)ab.contents + o;
-    int defer = len >= 512 && ubc_on() && (c || !um_hits(lo, hi)); uint64_t ready = 0;   // small ones (bindless handles read on the CPU), and those um_overlay writes into, are copied here
+    int defer = len >= 512 && ubc_on() && !g_ubp_sync && (c || !um_hits(lo, hi)); uint64_t ready = 0;   // small ones (bindless handles read on the CPU), and those um_overlay writes into, are copied here
     if (defer) ready = ubc_push(d, c ? c->cpu : (const uint8_t *)(uintptr_t)lo, (size_t)len);   // the previous shadow's own copies are queued before these
     else { if (c) ubc_wait(c->ready); memcpy(d, c ? c->cpu : (const uint8_t *)(uintptr_t)lo, (size_t)len); }
     if (!c) um_overlay(lo, hi, d, ready);   // a shadow made from the previous one has them already
@@ -2371,15 +2386,23 @@ static id<MTLTexture> gpu_probe_tex(int side) { MTLTextureDescriptor *td = [MTLT
 // submissions. It tests whether the iPhone's GPU clock falls because the game's work leaves the GPU idle part of each frame (a controller that follows occupancy): if so, the game's
 // GPU time and the probe's shading time fall back in the phases with the fill. Not a product setting: the fill costs power. The count of fills is in the "[gpuprobe]" line.
 static _Atomic int g_fill_want; static _Atomic unsigned long g_fill_n;
+static _Atomic int g_fill_shape;   // 0: one pass of six draws on 256 x 256 (a block of shading); 1: sixteen one-triangle passes on 64 x 64 (the same thread, work cut into passes: DM_GPU_SHAPE_TEST)
 static void *gpu_fill_thread(void *arg) {
-    (void)arg; pthread_setname_np("dm-gpu-fill"); pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
-    id<MTLRenderPipelineState> ps = gpu_probe_ps(); id<MTLTexture> t[2] = {gpu_probe_tex(128), gpu_probe_tex(128)}; if (!ps || !t[0] || !t[1]) return NULL;
+    (void)arg; pthread_setname_np("dm-gpu-fill"); pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);   // utility: its few hundred commits a second need no fast core
+    id<MTLRenderPipelineState> ps = gpu_probe_ps(); id<MTLTexture> t[2] = {gpu_probe_tex(256), gpu_probe_tex(256)}, sm[2] = {gpu_probe_tex(64), gpu_probe_tex(64)}; if (!ps || !t[0] || !t[1] || !sm[0] || !sm[1]) return NULL;
     dispatch_semaphore_t sem = dispatch_semaphore_create(2);
     for (unsigned k = 0;; k++) { @autoreleasepool {
         if (!atomic_load(&g_fill_want)) { usleep(2000); continue; }
         dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new]; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].texture = t[k & 1];
-        id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; for (int i = 0; i < 6; i++) [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding];   // six draws a buffer: a sixth of the command buffers, whose CPU cost made the system lower the CPU clock under a constant fill
+        int shape = atomic_load(&g_fill_shape);
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new]; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLCommandBuffer> cb = [g_q commandBuffer];
+        if (shape) { rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].texture = sm[k & 1];
+            for (int i = 0; i < 16; i++) { id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; } }
+        else { rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].texture = t[k & 1];
+            // Six draws on 256 x 256 a buffer (about 0.5 ms at full clock): a 24th of the command buffers of the first fill (one draw on 128 x 128), whose CPU cost
+            // was part of what made the system lower the CPU clock under a long fill
+            id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; for (int i = 0; i < 6; i++) [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; }
         [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c; atomic_fetch_add(&g_fill_n, 1); dispatch_semaphore_signal(sem); }];
         [cb commit]; } }
     return NULL;
@@ -2409,6 +2432,17 @@ static void gpu_fill_frame(uint64_t f) {
         double r = base && est ? (double)est / base : 0;   // 0: not measured yet
         if (!calib_until && f >= 240) calib_until = f + 90;   // the full clock's time: once, early (the title screen)
         int calib = calib_until && f < calib_until;
+        // DM_GPU_SHAPE_TEST=1 (stay on the title screen for 25 s): after the block fill of the calibration, a rest, then the same thread's work cut into one-triangle
+        // passes, a rest, and the block again; the clock level after each is logged. Does the controller raise the clock for work in many small passes as for a block?
+        static int shape_test = -1; if (shape_test < 0) { const char *e = getenv("DM_GPU_SHAPE_TEST"); shape_test = e && atoi(e); }
+        if (shape_test && f <= 1420) { static unsigned long n0;
+            int frag = f >= 690 && f < 870, blk = f >= 1230 && f < 1410;
+            atomic_store(&g_fill_shape, frag);
+            if (f == 330 || f == 689 || f == 870 || f == 1229 || f == 1410) { unsigned long nn = atomic_load(&g_fill_n);
+                MLOG("[fillshape] frame %llu, %s: clock level %.2f (probe %.3f ms, full clock %.3f ms), %lu fill command buffers in the phase, game GPU %.2f ms", (unsigned long long)f,
+                     f == 330 ? "after 90 frames of the block fill" : f == 689 ? "after a rest of 6 s" : f == 870 ? "after 180 frames of the small-pass fill" : f == 1229 ? "after a second rest of 6 s" : "after 180 frames of the block fill",
+                     r, est / 1e3, base / 1e3, nn - n0, ema); n0 = nn; }
+            if (f > 330) { atomic_store(&g_fill_want, frag || blk); if (!started) { started = 1; pthread_t th; pthread_create(&th, NULL, gpu_fill_thread, NULL); pthread_detach(th); } return; } }
         if (!state) { if (!calib && r > 0 && r >= 1.2 && ema > 7.0 && (r > hi || ema > 12.0)) { state = 1; run = 0; kicks++; } }
         else { filled++; run++;
             // It stops by the clock alone: the fill itself adds about 1.3 ms to the game's GPU time, so a stop that also asked for a short GPU time kept the fill on for
@@ -11393,7 +11427,7 @@ static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MT
     // The block as the GPU will read it at this point: memory, with the inline updates of submissions still running and of this one laid over it (ubp_get: the host has
     // their bytes, the game's memory gets them only when their blit has run). So a block the game updates inline every frame is copied too, and its page needs no
     // protection; ubp_get refuses what the CPU cannot know (a copy, a fill or a shader's store still to come)
-    { uint64_t g; const uint8_t *c; if (ul <= UBP_MAX_BYTES && ubp_get(addr, addr + ul, &g, &c)) { g_fa_snap_n++; g_fa_snap_bytes += ul; ded[k].gpu = g; ded[k].buf = (__bridge void *)*use; return g; } }
+    { uint64_t g; const uint8_t *c; g_ubp_sync = 1; int got = ul <= UBP_MAX_BYTES && ubp_get(addr, addr + ul, &g, &c); g_ubp_sync = 0; if (got) { g_fa_snap_n++; g_fa_snap_bytes += ul; ded[k].gpu = g; ded[k].buf = (__bridge void *)*use; return g; } }
     // The copy is the memory as the CPU sees it now. What the GPU still has to write there (an inline update landing by a blit, a storage buffer write, a readback: the last
     // frame's, now that its end is not waited for) is not in it yet: such a block is read in place, in the GPU's order, as before
     if (!vol || g_sbw_over || sbw_hits(addr, addr + ul) || gw_live(addr, addr + ul) || hw_live(addr, addr + ul) || !nvn_host_readable(addr, ul)) { int k0 = g_fa_kind; if (vol) { g_fa_inplace_vol++; g_fa_kind = FA_K_GPUW; } fa_bind(addr, addr + ul); g_fa_kind = k0; return gpu; }
@@ -11415,6 +11449,14 @@ static void fa_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
 // work is committed while this one runs and the GPU is never idle between them. The display link still shows one frame a tick and drops none but the oldest
 static _Atomic uint64_t g_fa_skip;
 int mtl_fa_behind(void) { if (!fa_on() || atomic_load(&g_done) >= atomic_load(&g_fa_floor)) return 0; atomic_fetch_add(&g_fa_skip, 1); return 1; }
+// The in-place pointer and storage bindings seen, by stage, slot and size: said once each (what the write gate waits for when the game writes their pages)
+static void fa_ptr_note(int stage, int reg, int rw, int ubop, uint64_t addr, uint64_t size) {
+    static struct { int st, reg, rw, ubop; uint64_t size; } seen[48]; static int n;
+    for (int i = 0; i < n; i++) if (seen[i].st == stage && seen[i].reg == reg && seen[i].rw == rw && seen[i].ubop == ubop && seen[i].size == size) return;
+    if (n == 48) return;
+    seen[n].st = stage; seen[n].reg = reg; seen[n].rw = rw; seen[n].ubop = ubop; seen[n].size = size; n++;
+    MLOG("[ahead] read in place: stage %d %s slot %d, %s, %llu bytes at %#llx (frame %llu)", stage, ubop ? "pointer uniform" : "storage buffer", reg, rw ? "written by the shader" : "read only", (unsigned long long)size, (unsigned long long)addr, (unsigned long long)atomic_load(&g_cur_frame));
+}
 static void fa_frame(uint64_t f) {   // the submit thread, when the frame it replays changes: what is committed now belongs to earlier frames
     atomic_store(&g_fa_floor, atomic_load(&g_fence));
     static uint64_t p[12]; uint64_t v[12] = {g_fa_inplace_vol, atomic_load(&g_fa_ahead_n), atomic_load(&g_fa_real_n), g_fa_snap_n, g_fa_snap_bytes, g_fa_binds, g_fa_prot, atomic_load(&g_fa_gate_n), atomic_load(&g_fa_gate_ns), g_fa_blocks, atomic_load(&g_fa_gate_late), atomic_load(&g_fa_skip)};
@@ -11422,6 +11464,9 @@ static void fa_frame(uint64_t f) {   // the submit thread, when the frame it rep
         MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB), on volatile pages but read in place for a GPU write still to come %.1f; ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); by what read the page in place: uniform %llu, vertex %llu, index %llu, pointer or storage %llu, a block with a GPU write to come %llu (totals); submissions the wait must cover %.2f; acquires that skipped the display tick %.2f; volatile pages %llu; table full %llu, gate timeouts %llu",
              (unsigned long long)f, (v[1] - p[1]) / n, (v[2] - p[2]) / n, (v[3] - p[3]) / n, (v[4] - p[4]) / n / 1024.0, (v[0] - p[0]) / n, (v[5] - p[5]) / n, (v[6] - p[6]) / n, (v[7] - p[7]) / n, (v[8] - p[8]) / n / 1e6, (unsigned long long)atomic_load(&g_fa_gate_k[0]), (unsigned long long)atomic_load(&g_fa_gate_k[1]), (unsigned long long)atomic_load(&g_fa_gate_k[2]), (unsigned long long)atomic_load(&g_fa_gate_k[3]), (unsigned long long)atomic_load(&g_fa_gate_k[4]), (v[9] - p[9]) / n, (v[11] - p[11]) / n,
              (unsigned long long)atomic_load(&g_fa_vol_n), (unsigned long long)g_fa_full, (unsigned long long)(v[10] - p[10]));
+        { static uint64_t w0[6]; uint64_t w[6]; mtl_ubp_why(w);
+          MLOG("[ahead] copies refused since the last line (the block is then read in place): too large or shadows off %llu, a shader's store to come %llu, a copy or fill of a running submission %llu, a copy or fill of this submission %llu, unreadable %llu, a report to land %llu; storage writes answered by a wide write %llu (the last %llu bytes wide), by a cell %llu, write set full now %d",
+               (unsigned long long)(w[0] - w0[0]), (unsigned long long)(w[1] - w0[1]), (unsigned long long)(w[2] - w0[2]), (unsigned long long)(w[3] - w0[3]), (unsigned long long)(w[4] - w0[4]), (unsigned long long)(w[5] - w0[5]), (unsigned long long)g_sbw_hit_wide, (unsigned long long)g_sbw_wide_bytes, (unsigned long long)g_sbw_hit_cell, g_sbw_over); memcpy(w0, w, sizeof w0); g_sbw_hit_wide = g_sbw_hit_cell = 0; }
         memcpy(p, v, sizeof p); }
 }
 // The game's wait on a fence (hle_nvn.c, nvn_queue.inc): with frame ahead on, a fence of the current frame is answered once the frames before it are complete, and the
@@ -11711,7 +11756,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); if (b->rw && b->kind == NVN_RB_SBUFP && !(reg < 32 && (sh->sb_ro >> reg & 1))) sbw_note(u->addr, sbw_len(u->size, mb, mo), SBW_GPU);   // cb_extent.tsv: slots the shader never writes
                 if (fa_on()) {   // frame ahead: a block the shader only reads is copied when its pages are volatile (as a uniform block, fa_cbuf), anything else is read in place
                     g_fa_kind = FA_K_PTR; if (!b->rw && u->size && u->size <= (256u << 10)) { __strong id<MTLBuffer> fb = (__bridge id<MTLBuffer>)mb; uint64_t g2 = fa_cbuf(u->addr, u->size, gpu, &fb); if (g2 != gpu) { slots[aid] = g2; USE(fb, MTLResourceUsageRead); } }
-                    else fa_bind(u->addr, u->addr + (u->size ? u->size : 1));
+                    else { fa_bind(u->addr, u->addr + (u->size ? u->size : 1)); fa_ptr_note(nvn_stage, reg, b->rw, b->kind == NVN_RB_UBOP, u->addr, u->size); }
                     g_fa_kind = FA_K_UNI; } }
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufp reg%d %s addr=%#llx size=%llu %s", g_stat_pass, nvn_stage, reg, u && u->addr ? "real" : "dummy", u ? (unsigned long long)u->addr : 0ull, u ? (unsigned long long)u->size : 0ull, b->rw ? "rw" : "ro");
