@@ -2389,7 +2389,7 @@ static _Atomic int g_fill_want; static _Atomic unsigned long g_fill_n;
 static _Atomic int g_fill_shape;   // 0: one pass of six draws on 256 x 256 (a block of shading); 1: sixteen one-triangle passes on 64 x 64 (the same thread, work cut into passes: DM_GPU_SHAPE_TEST)
 static void *gpu_fill_thread(void *arg) {
     (void)arg; pthread_setname_np("dm-gpu-fill"); pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);   // utility: its few hundred commits a second need no fast core
-    id<MTLRenderPipelineState> ps = gpu_probe_ps(); id<MTLTexture> t[2] = {gpu_probe_tex(256), gpu_probe_tex(256)}, sm[2] = {gpu_probe_tex(64), gpu_probe_tex(64)}; if (!ps || !t[0] || !t[1] || !sm[0] || !sm[1]) return NULL;
+    id<MTLRenderPipelineState> ps = gpu_probe_ps(); id<MTLTexture> t[2] = {gpu_probe_tex(128), gpu_probe_tex(128)}, sm[2] = {gpu_probe_tex(64), gpu_probe_tex(64)}; if (!ps || !t[0] || !t[1] || !sm[0] || !sm[1]) return NULL;
     dispatch_semaphore_t sem = dispatch_semaphore_create(2);
     for (unsigned k = 0;; k++) { @autoreleasepool {
         if (!atomic_load(&g_fill_want)) { usleep(2000); continue; }
@@ -2400,8 +2400,8 @@ static void *gpu_fill_thread(void *arg) {
         if (shape) { rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].texture = sm[k & 1];
             for (int i = 0; i < 16; i++) { id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; } }
         else { rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].texture = t[k & 1];
-            // Six draws on 256 x 256 a buffer (about 0.5 ms at full clock): a 24th of the command buffers of the first fill (one draw on 128 x 128), whose CPU cost
-            // was part of what made the system lower the CPU clock under a long fill
+            // Six draws on 128 x 128 a buffer. On 256 x 256 (four times the work a buffer) the game's passes waited behind the fill: its GPU time went from 10.7 to
+            // 12-13 ms, which kept the fill on for 84-88% of the frames
             id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; for (int i = 0; i < 6; i++) [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; }
         [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c; atomic_fetch_add(&g_fill_n, 1); dispatch_semaphore_signal(sem); }];
         [cb commit]; } }
@@ -2443,15 +2443,19 @@ static void gpu_fill_frame(uint64_t f) {
                      f == 330 ? "after 90 frames of the block fill" : f == 689 ? "after a rest of 6 s" : f == 870 ? "after 180 frames of the small-pass fill" : f == 1229 ? "after a second rest of 6 s" : "after 180 frames of the block fill",
                      r, est / 1e3, base / 1e3, nn - n0, ema); n0 = nn; }
             if (f > 330) { atomic_store(&g_fill_want, frag || blk); if (!started) { started = 1; pthread_t th; pthread_create(&th, NULL, gpu_fill_thread, NULL); pthread_detach(th); } return; } }
-        if (!state) { if (!calib && r > 0 && r >= 1.2 && ema > 7.0 && (r > hi || ema > 12.0)) { state = 1; run = 0; kicks++; } }
+        // The level the scene needs: the game's GPU time is its work at full clock (W, learned from frames with the fill off: the fill adds to the game's GPU time) times
+        // the level, and the serial frame leaves it about 11.5 ms, so the level to hold is 10 ms / W (a menu's W of 1 ms needs none; a scene of 8 ms needs 1.25). The fill
+        // runs in bursts of 45 frames at most, each followed by a rest half again as long (40% of the frames at most): a GPU kept full longer makes the system lower the
+        // CPU clock (4.0 -> 1.4 GHz at 85% of the frames filled, submit 4.5 -> 12 ms: the game was then late on the CPU), as it does for a game it takes to be GPU-bound
+        static double W; static uint64_t off_since, rest_until; (void)hi; (void)lo;
+        if (!state && !calib && r > 0 && f > off_since + 10) { double g = mtl_gpu_ms(seen); if (g > 0) { double w = g / r; W = W > 0 ? W + 0.1 * (w - W) : w; } }
+        double want = W > 0 ? 10.0 / W : 99; if (want < 1.0) want = 1.0;
+        if (!state) { if (!calib && r > 0 && W > 0 && f >= rest_until && r > want * 1.08 && r >= 1.15) { state = 1; run = 0; kicks++; } }
         else { filled++; run++;
-            // It stops by the clock alone: the fill itself adds about 1.3 ms to the game's GPU time, so a stop that also asked for a short GPU time kept the fill on for
-            // 55-72% of the frames (and the system then lowered the CPU clock: submit 5 → 11 ms, 54-58 fps)
-            if (run >= 20) { if (r > 0 && r < 1.2) { state = 0; if (ema > 12.0) atmax_stops++; }   // the clock is full: nothing more to gain
-                             else if (r > 0 && r < lo) state = 0;
-                             else if (ema <= 7.0) state = 0; } }
-        if (f && !(f % 600)) MLOG("[gpukeep] up to frame %llu: clock level %.2f (probe %.3f ms, full clock %.3f ms), game GPU running mean %.2f ms; %llu fills started, %llu frames filled in all, %llu stopped at full clock with the frame still long, thermal %d",
-                                  (unsigned long long)f, r, est / 1e3, base / 1e3, ema, (unsigned long long)kicks, (unsigned long long)filled, (unsigned long long)atmax_stops, (int)NSProcessInfo.processInfo.thermalState);
+            int stop = run >= 45 || (run >= 12 && r > 0 && (r < 1.1 || r < want * 0.92));
+            if (stop) { if (r > 0 && r < 1.15 && want <= 1.05) atmax_stops++; state = 0; off_since = f; rest_until = f + (uint64_t)(run * 3 / 2); } }
+        if (f && !(f % 600)) MLOG("[gpukeep] up to frame %llu: clock level %.2f, wanted %.2f for %.2f ms of work at full clock (probe %.3f ms, full clock %.3f ms), game GPU running mean %.2f ms; %llu fills started, %llu frames filled in all, %llu ended at full clock in a scene that needs it, thermal %d",
+                                  (unsigned long long)f, r, want > 98 ? 0.0 : want, W, est / 1e3, base / 1e3, ema, (unsigned long long)kicks, (unsigned long long)filled, (unsigned long long)atmax_stops, (int)NSProcessInfo.processInfo.thermalState);
         atomic_store(&g_fill_want, state || calib || (mode && sw_on(mode)));
     } else atomic_store(&g_fill_want, mode && sw_on(mode));
     if (!started) { started = 1; pthread_t th; pthread_create(&th, NULL, gpu_fill_thread, NULL); pthread_detach(th); }
