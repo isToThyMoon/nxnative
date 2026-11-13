@@ -105,13 +105,28 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
         if (!busy_wait(r, p)) return 0;
     }
 }
+// The write gate (frame-ahead, nvn_mtl.m fa_gate): called with the address before a protected page is made writable for a game write (the fault) or a host write
+// (prep_write), on the writing thread. It may wait (for the GPU to finish what still reads the page) but takes no lock and allocates nothing: the fault path
+static _Atomic(void (*)(uintptr_t, uintptr_t)) g_gate;
+void nvn_dirty_set_gate(void (*g)(uintptr_t lo, uintptr_t hi)) { atomic_store(&g_gate, g); }
+enum { TR_MAX = 8192 };
+static _Atomic int g_tr_on; static _Atomic uint32_t g_tr_n; static _Atomic uintptr_t g_tr_a[TR_MAX]; static _Atomic uint64_t g_tr_t[TR_MAX];
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     if (!is_write) return 0;
     uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
+    { void (*g)(uintptr_t, uintptr_t) = atomic_load_explicit(&g_gate, memory_order_relaxed); if (g) g(a & ~(g_pg - 1), (a & ~(g_pg - 1)) + g_pg); }
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
+    if (ours && atomic_load_explicit(&g_tr_on, memory_order_relaxed)) { uint32_t k = atomic_fetch_add(&g_tr_n, 1); if (k < TR_MAX) { atomic_store(&g_tr_a[k], a); atomic_store(&g_tr_t[k], mach_absolute_time()); } }
     return ours;
+}
+// The write trace (DM_NVN_WSET, measurement): the address and time of each fault a game write took on a protected page, kept until taken. Atomics only: the fault path.
+uint32_t nvn_dirty_trace_take(uintptr_t *a, uint64_t *t, uint32_t cap) {
+    atomic_store(&g_tr_on, 1);
+    uint32_t n = atomic_exchange(&g_tr_n, 0); if (n > TR_MAX) n = TR_MAX; if (n > cap) n = cap;
+    for (uint32_t i = 0; i < n; i++) { a[i] = atomic_load(&g_tr_a[i]); t[i] = atomic_load(&g_tr_t[i]); }
+    return n;
 }
 // Unprotect pages p..q of a range with one mprotect per run of protected pages (a host write over a whole texture, e.g. WriteTexels, used to make one system call per 16 KB page:
 // Link's Awakening, about 275 a frame). Pages another thread is changing are handled one by one after the run so far is finished, so no BUSY page is held while waiting
@@ -132,6 +147,7 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
 static void prep_write(void *addr, size_t len) {
     uintptr_t a = (uintptr_t)addr, e = a + len; int n = atomic_load(&g_nr), in = 0;
     if (!len) return;
+    { void (*g)(uintptr_t, uintptr_t) = atomic_load_explicit(&g_gate, memory_order_relaxed); if (g) g(a, e); }
     for (int i = 0; i < n; i++) {
         range_t *r = rg(i);
         if (!live_at(i) || e <= r->base || a >= r->end) continue;

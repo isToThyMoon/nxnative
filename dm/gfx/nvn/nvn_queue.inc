@@ -111,9 +111,10 @@ static void nq_cost_end(nq_cost c) {
     atomic_fetch_add(&g_sub_instr,ins-c.instr); atomic_fetch_add(&g_cum_sub_instr,ins-c.instr);
     atomic_fetch_add(&g_cum_sub_cyc,cyc-c.cycles); atomic_fetch_add(&g_cum_sub_sys_ns,thr_sys_ns()-c.sys);
 }
+qos_class_t dm_host_qos(void);   // hle_thread.c (DM_HOST_QOS)
 static void *nq_worker(void *unused) {
     (void)unused; pthread_setname_np("NVN queue replay");
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
+    pthread_set_qos_class_self_np(dm_host_qos(), 0);
     uint64_t frame=UINT64_MAX;
     for(;;) {
         pthread_mutex_lock(&nq_mu); nq_queue *q=NULL; nq_node *n=NULL; nq_job *j=NULL;
@@ -320,7 +321,7 @@ int nvn_sync_wait(const sync_t *s,uint64_t timeout) {
         else { uint64_t left=timeout-elapsed; struct timespec ts={(time_t)(left/1000000000ull),(long)(left%1000000000ull)}; pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&ts); }
     }
     pthread_mutex_unlock(&nq_mu); uint64_t elapsed=now_ns()-start;
-    return mtl_wait(fence,timeout==UINT64_MAX?timeout:elapsed>=timeout?0:timeout-elapsed);
+    return mtl_wait_ahead(fence,timeout==UINT64_MAX?timeout:elapsed>=timeout?0:timeout-elapsed);
 }
 void nvn_queue_wait_sync(queue_t *q,const sync_t *s) {
     if(atomic_load(&nq_stop) || dm_teardown_is_parking()) {

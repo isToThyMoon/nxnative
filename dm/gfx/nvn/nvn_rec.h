@@ -39,8 +39,9 @@ static int ubc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv
 static inline void ubc_kick(void) {
     if (atomic_load(&g_ubc_sleeping)) { atomic_fetch_add_explicit(&g_ubc_wakes, 1, memory_order_relaxed); os_sync_wake_by_address_any(&g_ubc_head, sizeof g_ubc_head, OS_SYNC_WAKE_BY_ADDRESS_NONE); }
 }
+qos_class_t dm_host_qos(void);   // hle_thread.c (DM_HOST_QOS)
 static void *ubc_thread(void *arg) {
-    (void)arg; pthread_setname_np("dm-ub-copy"); pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    (void)arg; pthread_setname_np("dm-ub-copy"); pthread_set_qos_class_self_np(dm_host_qos(), 0);
     for (uint64_t t = 0;;) {
         uint64_t h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);
         for (int spin = 0; spin < 2000 && t == h && !atomic_load_explicit(&g_ubc_stop, memory_order_relaxed); spin++) h = atomic_load_explicit(&g_ubc_head, memory_order_acquire);   // a submission queues copies in bursts: stay awake a moment
@@ -211,7 +212,7 @@ static void rec_exec(const rec_t *r) {
 }
 static void *rec_thread(void *arg) {
     (void)arg; pthread_setname_np("dm-encode");
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_set_qos_class_self_np(dm_host_qos(), 0);
     for (;;) {
         pthread_mutex_lock(&g_rb_mu);
         while (!g_rb_head && !g_rb_stop) { g_rb_sleeping = 1; pthread_cond_wait(&g_rb_work, &g_rb_mu); g_rb_sleeping = 0; }

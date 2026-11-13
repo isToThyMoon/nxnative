@@ -2348,7 +2348,91 @@ static void gpu_capture_frame(uint64_t f) {
         else MLOG("[RED] DM_GPU_CAPTURE: the capture did not start: %s", err.localizedDescription.UTF8String);
     } else if (g_cap_on && f >= (uint64_t)g_cap_f0 + (uint64_t)g_cap_n) { [m stopCapture]; g_cap_on = 0; g_cap_f0 = -1; gpu_thr = 0; MLOG("DM_GPU_CAPTURE: capture stopped at frame %llu (the trace is written in the background)", (unsigned long long)f); }
 }
-void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); gpu_capture_frame(f); }
+// DM_GPU_PROBE=<n> (diagnostic): every n frames two fixed workloads run in command buffers of their own on the old queue, and a "[gpuprobe]" line gives the GPU time of each: one 512 x 512 pass
+// whose fragment shader loops 96 times (shading speed, so the GPU's clock), and 16 passes of one triangle on a 64 x 64 target (the cost of a pass). Their work never changes, so a change in
+// their time is the GPU, not the game: it tells a lower clock (both grow alike) from passes that cost more (the second grows more) and from a game whose own work grew (neither grows).
+// "queued" is the time from the end of kernel scheduling to the GPU start, which grows when the probe waited behind the game's work.
+static int wset_on(void); static void wset_frame(uint64_t f);
+static inline int fa_on(void); static void fa_frame(uint64_t f); static uint64_t g_fa_epoch;
+static id<MTLRenderPipelineState> gpu_probe_ps(void) {   // the probes' one pipeline (any thread)
+    static id<MTLRenderPipelineState> ps; static dispatch_once_t once;
+    dispatch_once(&once, ^{ NSError *e = nil;
+        id<MTLLibrary> lib = [g_dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\n"
+            "struct V { float4 p [[position]]; };\n"
+            "vertex V pv(uint i [[vertex_id]]) { V o; o.p = float4(float((i << 1) & 2) * 2.0 - 1.0, float(i & 2) * 2.0 - 1.0, 0.5, 1.0); return o; }\n"
+            "fragment float4 pf(V v [[stage_in]]) { float a = v.p.x * 0.001 + v.p.y * 0.002; for (int i = 0; i < 96; i++) a = fract(sin(a * 12.9898 + float(i)) * 43758.5453); return float4(a); }\n" options:nil error:&e];
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new]; d.vertexFunction = [lib newFunctionWithName:@"pv"]; d.fragmentFunction = [lib newFunctionWithName:@"pf"]; d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+        if (lib) ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
+        if (!ps) MLOG("[RED] DM_GPU_PROBE / DM_GPU_FILL: no pipeline: %s", e.description.UTF8String); });
+    return ps;
+}
+static id<MTLTexture> gpu_probe_tex(int side) { MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:side height:side mipmapped:NO]; td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModePrivate; return [g_dev newTextureWithDescriptor:td]; }
+// DM_GPU_FILL=1 or ab (experiment): a thread keeps the GPU busy with small command buffers of the probe's shading (128 x 128, two in flight: a larger one holds the game's passes back at a low clock), so the GPU is never idle between the game's
+// submissions. It tests whether the iPhone's GPU clock falls because the game's work leaves the GPU idle part of each frame (a controller that follows occupancy): if so, the game's
+// GPU time and the probe's shading time fall back in the phases with the fill. Not a product setting: the fill costs power. The count of fills is in the "[gpuprobe]" line.
+static _Atomic int g_fill_want; static _Atomic unsigned long g_fill_n;
+static void *gpu_fill_thread(void *arg) {
+    (void)arg; pthread_setname_np("dm-gpu-fill"); pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    id<MTLRenderPipelineState> ps = gpu_probe_ps(); id<MTLTexture> t[2] = {gpu_probe_tex(128), gpu_probe_tex(128)}; if (!ps || !t[0] || !t[1]) return NULL;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(2);
+    for (unsigned k = 0;; k++) { @autoreleasepool {
+        if (!atomic_load(&g_fill_want)) { usleep(2000); continue; }
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new]; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].texture = t[k & 1];
+        id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding];
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c; atomic_fetch_add(&g_fill_n, 1); dispatch_semaphore_signal(sem); }];
+        [cb commit]; } }
+    return NULL;
+}
+// DM_GPU_KEEP=1 or =<on ms>,<off ms> (experiment, iPhone): holds the GPU's clock up with the fill. The iPhone's GPU controller lowers the clock a level about every second while the GPU is
+// idle part of each frame (the probe's shading: 0.33 ms at full clock, 0.53-0.66 while Breath of the Wild holds 60 fps at 8 ms of GPU time, then 0.82, 1.07 and 1.54 ms, where the same
+// frame takes 22 ms), and once a frame is late the game shows frames for two vsyncs, the GPU is idle for longer and the clock never comes back: 33 fps on a cool phone. The fill makes
+// the controller raise the clock within 30 frames. It runs while the game's GPU time (a running mean of the newest frames whose command buffers completed) is above <on ms> (default
+// 10.5) and stops below <off ms> (default 9.0), so the clock stays at the level where the game's work fills about 60% of the frame. A fill that has run for 120 frames in a row
+// without the GPU time falling below <on ms> is a scene that costs that much at full clock, and pauses for 5 s. "[gpukeep]" lines: every 600 frames the fills started, the frames
+// filled and the pauses. DM_GPU_FILL=1 / ab is the fill alone, always on or by DM_AB phase.
+static void gpu_fill_frame(uint64_t f) {
+    static int mode = -1, keep, started, state, run; static double on_ms = 10.5, off_ms = 9.0, ema; static uint64_t hold_until, kicks, pauses, filled, seen;
+    if (mode < 0) { mode = sw_mode("DM_GPU_FILL", 0); if (mode) MLOG("DM_GPU_FILL: the GPU is kept busy between the game's submissions (experiment)");
+        const char *e = getenv("DM_GPU_KEEP"); keep = e && atof(e) > 0;
+        if (keep) { double a = 0, b = 0; int n = sscanf(e, "%lf,%lf", &a, &b); if (n >= 1 && a > 1.5) on_ms = a; if (n >= 2 && b > 0 && b < on_ms) off_ms = b; else if (off_ms >= on_ms) off_ms = on_ms * 0.85;
+            MLOG("DM_GPU_KEEP: the fill runs while the game's GPU time is above %.1f ms, until it is below %.1f ms (experiment)", on_ms, off_ms); } }
+    if (!mode && !keep) return;
+    if (keep) {
+        for (uint64_t k = f > 2 ? f - 2 : 0; k > seen && k + 12 > f; k--) { double g = mtl_gpu_ms(k); if (g > 0) { ema = ema > 0 ? ema + 0.3 * (g - ema) : g; seen = k; break; } }
+        if (!state) { if (ema > on_ms && f >= hold_until) { state = 1; run = 0; kicks++; } }
+        else { filled++; run++;
+            if (ema < off_ms) state = 0;
+            else if (run >= 120 && ema > on_ms) { state = 0; pauses++; hold_until = f + 300; } }
+        if (f && !(f % 600)) MLOG("[gpukeep] up to frame %llu: %llu fills started, %llu frames filled in all, %llu pauses, GPU running mean %.2f ms, thermal %d", (unsigned long long)f, (unsigned long long)kicks, (unsigned long long)filled, (unsigned long long)pauses, ema, (int)NSProcessInfo.processInfo.thermalState);
+    }
+    atomic_store(&g_fill_want, state || (mode && sw_on(mode)));
+    if (!started) { started = 1; pthread_t th; pthread_create(&th, NULL, gpu_fill_thread, NULL); pthread_detach(th); }
+}
+static void gpu_probe_frame(uint64_t f) {
+    static long every = -2; static _Atomic int busy;
+    if (every == -2) { const char *e = getenv("DM_GPU_PROBE"); every = e ? atol(e) : 0; if (every > 0) MLOG("DM_GPU_PROBE: two fixed GPU workloads are timed every %ld frames", every); }
+    if (every <= 0 || f % (uint64_t)every || atomic_exchange(&busy, 1)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
+        static id<MTLTexture> big, small;
+        id<MTLRenderPipelineState> ps = gpu_probe_ps();
+        if (!big) { big = gpu_probe_tex(512); small = gpu_probe_tex(64); }
+        if (!ps || !big || !small) return;   // busy stays set: no further probe
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new]; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLCommandBuffer> a = [g_q commandBuffer]; rp.colorAttachments[0].texture = big;
+        id<MTLRenderCommandEncoder> en = [a renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding];
+        id<MTLCommandBuffer> b = [g_q commandBuffer]; rp.colorAttachments[0].texture = small; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        for (int i = 0; i < 16; i++) { en = [b renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; }
+        static double ta, qa;
+        [a addCompletedHandler:^(id<MTLCommandBuffer> c) { ta = (c.GPUEndTime - c.GPUStartTime) * 1e3; qa = (c.GPUStartTime - c.kernelEndTime) * 1e3; }];
+        [b addCompletedHandler:^(id<MTLCommandBuffer> c) {
+            MLOG("[gpuprobe] F%llu shading %.3f ms (queued %.3f), 16 small passes %.3f ms (queued %.3f), thermal %d, fill %s %lu so far, game GPU %.2f ms", (unsigned long long)f, ta, qa, (c.GPUEndTime - c.GPUStartTime) * 1e3, (c.GPUStartTime - c.kernelEndTime) * 1e3,
+                 (int)NSProcessInfo.processInfo.thermalState, atomic_load(&g_fill_want) ? "on" : "off", atomic_load(&g_fill_n), f > 8 ? mtl_gpu_ms(f - 8) : -1.0);
+            atomic_store(&busy, 0); }];
+        [a commit]; [b commit];
+    } });
+}
+void mtl_set_frame(uint64_t f) { atomic_store(&g_cur_frame, f); if (g_ub_n) ub_frame(f); if (ab_len()) ab_frame(f); gpu_capture_frame(f); gpu_fill_frame(f); gpu_probe_frame(f); if (wset_on()) wset_frame(f); if (fa_on()) fa_frame(f); }
 // GPU timing registration: gpu_tag_begin(frame) before commit, gpu_tag_done(frame, GPU start, GPU end) on completion (seconds on the CACurrentMediaTime base).
 // Old-queue command buffers go through gpu_tag_f; the Metal 4 main submission backfills in the feedback of mtl_sub_commit (when switching to Metal 4 all the call sites were lost and the GPU column of the timing line became empty)
 static void gpu_tag_begin(uint64_t f) {
@@ -11165,6 +11249,122 @@ static uint64_t ub_padded(NvShader *sh, int st, int reg, const p_bind_buf *u, ui
 }
 // A CBUF slot's GPU address, and in *use the buffer it points into: the bound uniform buffer; the shadow of inline updates deferred in this pass; an arena copy padded with zeros
 // when the binding is shorter than the shader reads it at fixed offsets (ub_padded); or the all-zero bank when nothing usable is bound. The full encode and the patch take it from here
+// ---------- Frame ahead (DM_FRAME_AHEAD): the game may build frame N + 1 while the GPU runs frame N ----------
+// The game waits for the fence of the frame it just submitted before it writes the next frame's data, because the GPU reads its memory in place (the pools are zero-copy
+// buffers) and Breath of the Wild writes the next frame's uniform blocks over the last frame's (190 of the 1,710 pages a frame's draws read, from 0.07 ms into the frame). So
+// CPU and GPU take turns, the GPU is idle while the game builds a frame, and a GPU clock controller that follows occupancy lowers the clock until frames are late.
+// With this switch the wait on the newest fence returns once the submissions before the current frame are complete (g_fa_floor), and the memory is kept right page by page:
+// - a page a draw binds is tracked (g_fa: the fence and frame that read it last) and write-protected; a write to it (the fault, or a host write) passes fa_gate, which waits
+//   until that fence is complete when it belongs to an earlier frame, then marks the page volatile;
+// - a uniform block on a volatile page is copied into the submission's arena when it is bound (fa_cbuf) and the draw reads the copy, so the page needs no protection;
+// - what the host cannot place yet (a binding that reaches any pool, a compute stage's buffers) sets g_fa_block: the wait then covers that submission as before.
+// A wrong guess costs a wait, never a wrong picture. "[ahead]" lines every 600 frames give the counts. DM_FRAME_AHEAD=ab alternates with the DM_AB phases
+typedef struct { _Atomic uint64_t page, fence; _Atomic uint32_t frame; _Atomic uint8_t vol, prot; } fa_pg;
+enum { FA_PG = 1 << 18, FA_DED = 4096 };
+static fa_pg g_fa[FA_PG];
+static int g_fa_mode = -1;
+static _Atomic uint64_t g_fa_floor, g_fa_block, g_fa_gate_n, g_fa_gate_ns, g_fa_gate_late, g_fa_vol_n;
+static uint64_t g_fa_snap_n, g_fa_snap_bytes, g_fa_binds, g_fa_prot, g_fa_blocks, g_fa_full;
+static _Atomic uint64_t g_fa_ahead_n, g_fa_real_n;
+static void fa_gate(uintptr_t lo, uintptr_t hi);
+__attribute__((noinline)) static int fa_mode_init(void) {
+    g_fa_mode = sw_mode("DM_FRAME_AHEAD", 0);
+    if (g_fa_mode) { nvn_dirty_set_gate(fa_gate); MLOG("DM_FRAME_AHEAD: the game's wait on its newest fence covers the frames before the current one, and bound memory is kept by page (experiment)"); }
+    return g_fa_mode;
+}
+static inline int fa_on(void) { int m = g_fa_mode < 0 ? fa_mode_init() : g_fa_mode; return m && sw_on(m); }
+static fa_pg *fa_find(uint64_t pg, int make) {
+    unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 46) & (FA_PG - 1);
+    for (int i = 0; i < 32; i++, h = (h + 1) & (FA_PG - 1)) {
+        uint64_t v = atomic_load_explicit(&g_fa[h].page, memory_order_relaxed);
+        if (v == pg) return &g_fa[h];
+        if (!v) { if (!make) return NULL; uint64_t z = 0; if (atomic_compare_exchange_strong(&g_fa[h].page, &z, pg) || z == pg) return &g_fa[h]; }
+    }
+    return NULL;
+}
+// Before a protected page of [lo, hi) is made writable (nvn_dirty.c; any thread, also the fault path: atomics and a sleep only)
+static void fa_gate(uintptr_t lo, uintptr_t hi) {
+    if (hi <= lo) return;
+    if (hi - lo > (64u << 20)) {   // a whole pool (its destruction): everything committed so far
+        uint64_t f = atomic_load(&g_fence); for (int k = 0; k < 20000 && atomic_load(&g_done) < f; k++) usleep(100);
+        return; }
+    int sub = on_sub_thread(); uint32_t cur = (uint32_t)atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
+    for (uint64_t pg = (uint64_t)lo >> 14; pg <= ((uint64_t)hi - 1) >> 14; pg++) {
+        fa_pg *e = fa_find(pg, 0); if (!e) continue;
+        atomic_store(&e->prot, 0);
+        if (!atomic_exchange(&e->vol, 1)) atomic_fetch_add(&g_fa_vol_n, 1);
+        uint64_t f = atomic_load(&e->fence);
+        // The submit thread's own writes (an inline update landing) keep their order with the frame being replayed, as before; they wait only for an earlier frame's readers.
+        // A fence not committed yet is the frame in replay: nothing to wait for
+        if (f > atomic_load(&g_fence) || f <= atomic_load(&g_done) || (sub && atomic_load(&e->frame) == cur)) continue;
+        uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int k = 0;
+        for (; k < 30000 && atomic_load(&g_done) < f; k++) usleep(100);
+        atomic_fetch_add(&g_fa_gate_n, 1); atomic_fetch_add(&g_fa_gate_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0); if (k >= 30000) atomic_fetch_add(&g_fa_gate_late, 1);
+    }
+}
+static void fa_block(void) { uint64_t f = atomic_load(&g_fence) + 1; if (atomic_load(&g_fa_block) != f) { atomic_store(&g_fa_block, f); g_fa_blocks++; } }
+// A zero-copy binding of [lo, hi): its pages are read by the submission being replayed, and protected so that a write passes the gate
+static void fa_bind(uint64_t lo, uint64_t hi) {
+    static struct { uint64_t lo, hi, f; } ded[FA_DED];
+    if (hi <= lo) return;
+    if (hi - lo > (256ull << 20)) { fa_block(); return; }
+    uint64_t f = atomic_load(&g_fence) + 1; uint32_t fr = (uint32_t)atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
+    unsigned k = (unsigned)(((lo * 0x9E3779B97F4A7C15ull) ^ (hi * 0xC2B2AE3D27D4EB4Full)) >> 52) & (FA_DED - 1);
+    if (ded[k].lo == lo && ded[k].hi == hi && ded[k].f == f) return;
+    int need = 0; g_fa_binds++;
+    for (uint64_t pg = lo >> 14; pg <= (hi - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 1);
+        if (!e) { g_fa_full++; fa_block(); return; }
+        atomic_store(&e->fence, f); atomic_store(&e->frame, fr);
+        if (!atomic_exchange(&e->prot, 1)) need = 1; }   // set before the protection lands: a write after it clears the flag again in the gate
+    if (need) { uint64_t a = lo & ~0x3fffull, b = (hi + 0x3fff) & ~0x3fffull;
+        if (!nvn_dirty_tracked((const void *)(uintptr_t)lo, (size_t)(hi - lo))) { fa_block(); for (uint64_t pg = lo >> 14; pg <= (hi - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e) atomic_store(&e->prot, 0); } return; }
+        nvn_dirty_protect((const void *)(uintptr_t)a, (size_t)(b - a)); g_fa_prot++; }
+    ded[k].lo = lo; ded[k].hi = hi; ded[k].f = f;
+}
+// The GPU address a uniform block of [addr, addr + ul) is read at: in place (gpu) when none of its pages is volatile, else a copy made now in the submission's arena
+static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MTLBuffer> *use) {
+    static struct { uint64_t addr, ul, ep, ver, gpu; void *buf; } ded[FA_DED];
+    if (!ul) return gpu;
+    int vol = 0;
+    for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && atomic_load_explicit(&e->vol, memory_order_relaxed)) { vol = 1; break; } }
+    if (!vol) { fa_bind(addr, addr + ul); return gpu; }
+    unsigned k = (unsigned)(((addr * 0x9E3779B97F4A7C15ull) ^ (ul * 0xC2B2AE3D27D4EB4Full)) >> 52) & (FA_DED - 1);
+    if (ded[k].addr == addr && ded[k].ul == ul && ded[k].ep == g_fa_epoch && ded[k].ver == g_ubd_ver) { *use = (__bridge id<MTLBuffer>)ded[k].buf; return ded[k].gpu; }
+    id<MTLBuffer> ab; size_t o = arena_alloc((size_t)ul, &ab);
+    memcpy((uint8_t *)ab.contents + o, (const void *)(uintptr_t)addr, (size_t)ul);
+    g_fa_snap_n++; g_fa_snap_bytes += ul;
+    ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = g_fa_epoch; ded[k].ver = g_ubd_ver; ded[k].gpu = ab.gpuAddress + o; ded[k].buf = (__bridge void *)ab;
+    *use = ab; return ab.gpuAddress + o;
+}
+// A draw's other memory: vertex, index and indirect buffers and the storage buffers its shaders take by address are read in place
+static void fa_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+    for (int s_ = 0; s_ < 16; s_++) if (S.vbuf[s_].address) fa_bind(S.vbuf[s_].address, S.vbuf[s_].address + S.vbuf[s_].size);
+    if (di && di->ibuf) fa_bind(di->ibuf, di->ibuf + (uint64_t)di->count * 4);
+    uint64_t ind = dw ? dw->ind : di ? di->ind : 0; if (ind) fa_bind(ind, ind + 32);
+    for (int st = 0; pr && st < 2; st++) { NvShader *sh = pr->sh[st]; if (!sh) continue;
+        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; if (b->reg >= 16) continue;
+            if (b->kind == NVN_RB_SBUFP) { const p_bind_buf *u = &S.ssbo[st][b->reg]; if (u->addr) fa_bind(u->addr, u->addr + (u->size ? u->size : 1)); }
+            else if (b->kind == NVN_RB_UBOP) { const p_bind_buf *u = &S.ubo[st][b->reg]; if (u->addr) fa_bind(u->addr, u->addr + (u->size ? u->size : 1)); } } }
+}
+static void fa_frame(uint64_t f) {   // the submit thread, when the frame it replays changes: what is committed now belongs to earlier frames
+    atomic_store(&g_fa_floor, atomic_load(&g_fence));
+    static uint64_t p[10]; uint64_t v[10] = {atomic_load(&g_fa_ahead_n), atomic_load(&g_fa_real_n), g_fa_snap_n, g_fa_snap_bytes, g_fa_binds, g_fa_prot, atomic_load(&g_fa_gate_n), atomic_load(&g_fa_gate_ns), g_fa_blocks, atomic_load(&g_fa_gate_late)};
+    if (f && !(f % 600)) { double n = 600.0;
+        MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB); ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); submissions the wait must cover %.2f; volatile pages %llu; table full %llu, gate timeouts %llu",
+             (unsigned long long)f, (v[0] - p[0]) / n, (v[1] - p[1]) / n, (v[2] - p[2]) / n, (v[3] - p[3]) / n / 1024.0, (v[4] - p[4]) / n, (v[5] - p[5]) / n, (v[6] - p[6]) / n, (v[7] - p[7]) / n / 1e6, (v[8] - p[8]) / n,
+             (unsigned long long)atomic_load(&g_fa_vol_n), (unsigned long long)g_fa_full, (unsigned long long)(v[9] - p[9]));
+        memcpy(p, v, sizeof p); }
+}
+// The game's wait on a fence (hle_nvn.c, nvn_queue.inc): with frame ahead on, a fence of the current frame is answered once the frames before it are complete, and the
+// submissions that hold what the host cannot keep by page (g_fa_block)
+int mtl_wait_ahead(uint64_t fence, uint64_t timeout_ns) {
+    if (!fa_on()) return mtl_wait(fence, timeout_ns);
+    uint64_t need = atomic_load(&g_fa_floor), blk = atomic_load(&g_fa_block);
+    if (blk > need) need = blk;
+    if (need >= fence) { if (timeout_ns) atomic_fetch_add(&g_fa_real_n, 1); return mtl_wait(fence, timeout_ns); }
+    if (timeout_ns) atomic_fetch_add(&g_fa_ahead_n, 1);
+    return need ? mtl_wait_at(need, timeout_ns, !timeout_ns ? WS_SYNC_POLL : WS_SYNC) : 1;
+}
 static uint64_t cbuf_slot(NvShader *sh, int nvn_stage, const nvn_rbind *b, __strong id<MTLBuffer> *use) {
     int reg = b->reg; const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
     void *mb; uint64_t mo, gpu;
@@ -11182,6 +11382,7 @@ static uint64_t cbuf_slot(NvShader *sh, int nvn_stage, const nvn_rbind *b, __str
         uint64_t g; const uint8_t *c; if (ubd_covers(u->addr, u->addr + ul)) gpu = ubd_shadow(u->addr, u->addr + ul);
         else if (ubp_get(u->addr, u->addr + ul, &g, &c)) gpu = g;
         else RED_ONCE(92, "a uniform update deferred inside the pass covers only part of the binding (stage %d cb%d): the content before the update is read", nvn_stage, reg); }
+    else if (fa_on()) { if (nvn_stage > 1) fa_block(); else gpu = fa_cbuf(u->addr, ul, gpu, use); }   // a compute stage's memory is not kept by page yet
     return gpu;
 }
 // The uniform slots' bound sizes (DMSH_CBSIZE_BANK), which the translator's reads at computed offsets compare with: one past its slot's size, rounded up to 256 bytes (ub_bound), gives 0, as on Maxwell. 0 for an unbound slot,
@@ -11461,6 +11662,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             USE(cb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_GMEM || b->kind == NVN_RB_GMEML) {   // B: the memory pool table for addresses traced to no storage buffer (gmem_map), and the write log of those stores (gml_take)
             if (!raw_map) raw_map = gmem_map();   // the log and the shader use the same table even if a pool comes in during the encode
+            if (fa_on()) fa_block();   // reaches any pool: the frame-ahead wait covers this submission
             slots[aid] = b->kind == NVN_RB_GMEM ? raw_map.gpuAddress : gml_take(raw_map);
             if (b->kind == NVN_RB_GMEM) gmem_aid = aid; else gml_taken = 1;
             if (bl && b->kind == NVN_RB_GMEM) PD("B %llu st%d gmem %s", g_stat_pass, nvn_stage, b->rw ? "rw" : "ro");
@@ -13697,6 +13899,58 @@ static int ubd_conflict(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     for (int st = 0; pr && st < 2; st++) if (pr->sh[st] && ubd_conflict_sh(pr->sh[st], st)) return 1;
     return 0;
 }
+// DM_NVN_WSET=1 (measurement, for the frame-packet design): how much of the memory a frame's draws read does the game write again before the next frame, and how soon. Every range a
+// draw binds (uniform blocks as far as the shader reads them, vertex and index buffers, storage buffers) is write-protected when the draw is replayed, once per frame and range; a game
+// write then takes a fault, which nvn_dirty.c traces with its time. At each frame's start the faults since the last are sorted: on a page bound in the last two frames (by kind) or not,
+// and by the time since the frame began. "[wset]" lines every 300 frames give per-frame means. The pages are 16 KB, so the bytes are an upper bound of what a copy at submit would take;
+// a host write (a landing update, a GPU readback) unprotects without a fault and is not counted. A written page counts when the frame before the one being built bound it (that
+// frame can still be running on the GPU); one last bound by an older frame is counted apart (a game that alternates buffers frame by frame writes only those). The protection costs faults and system calls: not for timing runs.
+static int wset_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_WSET"); v = e && atoi(e); if (v) MLOG("DM_NVN_WSET: the ranges draws bind are write-protected and the game's writes to them counted (measurement)"); } return v; }
+enum { WSET_DED = 8192, WSET_PG = 1 << 18 };
+static struct { uint64_t lo, hi, f; } g_wsd[WSET_DED];
+static struct { uint64_t page; uint32_t f, fp; uint8_t kind, kindp; } g_wsp[WSET_PG];   // fp, kindp: the frame it was bound in before that one, and as what   // page number → the last frame a draw bound it in, and as what (1 uniform, 2 vertex, 4 index, 8 storage)
+static uint64_t g_ws_ranges, g_ws_pages_bound;
+static void wset_rec(uint64_t lo, uint64_t hi, int kind) {
+    if (hi <= lo || hi - lo > (256ull << 20)) return;
+    uint64_t f = atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
+    unsigned k = (unsigned)(((lo * 0x9E3779B97F4A7C15ull) ^ (hi * 0xC2B2AE3D27D4EB4Full)) >> 51) & (WSET_DED - 1);
+    if (g_wsd[k].lo == lo && g_wsd[k].hi == hi && g_wsd[k].f == f) return;
+    g_wsd[k].lo = lo; g_wsd[k].hi = hi; g_wsd[k].f = f; g_ws_ranges++;
+    for (uint64_t pg = lo >> 14; pg <= (hi - 1) >> 14; pg++) { unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 46) & (WSET_PG - 1);
+        for (int probe = 0; probe < 16; probe++, h = (h + 1) & (WSET_PG - 1)) {
+            if (g_wsp[h].page == pg) { if (g_wsp[h].f != (uint32_t)f) { g_wsp[h].fp = g_wsp[h].f; g_wsp[h].kindp = g_wsp[h].kind; g_wsp[h].f = (uint32_t)f; g_wsp[h].kind = 0; g_ws_pages_bound++; } g_wsp[h].kind |= (uint8_t)kind; break; }
+            if (!g_wsp[h].page) { g_wsp[h].page = pg; g_wsp[h].f = (uint32_t)f; g_wsp[h].kind = (uint8_t)kind; g_ws_pages_bound++; break; } } }
+    nvn_dirty_protect((const void *)(uintptr_t)lo, (size_t)(hi - lo));
+}
+static void wset_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
+    (void)dw;
+    for (int s_ = 0; s_ < 16; s_++) if (S.vbuf[s_].address) wset_rec(S.vbuf[s_].address, S.vbuf[s_].address + S.vbuf[s_].size, 2);
+    if (di && di->ibuf) wset_rec(di->ibuf, di->ibuf + (uint64_t)di->count * 4, 4);
+    for (int st = 0; pr && st < 2; st++) { NvShader *sh = pr->sh[st]; if (!sh) continue;
+        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; if (b->kind == NVN_RB_GMEM || b->reg >= 16) continue;
+            const p_bind_buf *u = b->kind == NVN_RB_SBUFP ? &S.ssbo[st][b->reg] : &S.ubo[st][b->reg]; if (!u->addr) continue;
+            if (b->kind == NVN_RB_SBUFP) wset_rec(u->addr, u->addr + u->size, 8);
+            else wset_rec(u->addr, u->addr + (b->kind == NVN_RB_CBUF ? cb_len(sh, b->reg, u->size) : u->size), 1); } }
+}
+static void wset_frame(uint64_t f) {   // the frame begins (the game thread, at its present): sort the faults since the last
+    static uintptr_t a[8192]; static uint64_t t[8192]; static uint64_t t_prev, frames, sum[5], bucket[6], first_sum, first_n, ranges0, pages0; static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    uint32_t n = nvn_dirty_trace_take(a, t, 8192); uint64_t now = mach_absolute_time(), first = UINT64_MAX; static uint64_t older;
+    for (uint32_t i = 0; i < n; i++) { uint64_t pg = (uint64_t)a[i] >> 14; unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 46) & (WSET_PG - 1); int kind = 0;
+        for (int probe = 0; probe < 16; probe++, h = (h + 1) & (WSET_PG - 1)) { if (g_wsp[h].page == pg) { uint32_t fl = (uint32_t)f - 2; if (g_wsp[h].f == fl) kind = g_wsp[h].kind; else if (g_wsp[h].f == fl + 1 && g_wsp[h].fp == fl) kind = g_wsp[h].kindp; else if (g_wsp[h].f + 64 > (uint32_t)f) older++; break; } if (!g_wsp[h].page) break; }
+        if (!kind) { sum[4]++; continue; }
+        sum[kind & 1 ? 0 : kind & 2 ? 1 : kind & 4 ? 2 : 3]++;
+        double ms = t_prev && t[i] > t_prev ? (double)(t[i] - t_prev) * tb.numer / tb.denom / 1e6 : 0;
+        bucket[ms < 1 ? 0 : ms < 2 ? 1 : ms < 4 ? 2 : ms < 8 ? 3 : ms < 12 ? 4 : 5]++; if (t[i] < first) first = t[i]; }
+    if (first != UINT64_MAX && t_prev && first > t_prev) { first_sum += first - t_prev; first_n++; }
+    t_prev = now; frames++;
+    if (f && !(f % 300) && frames) { double nf = (double)frames, w = sum[0] + sum[1] + sum[2] + sum[3];
+        MLOG("[wset] up to frame %llu, per frame: bound %.0f ranges on %.0f pages (%.1f MB); written while the frame that bound them may still run on the GPU %.1f pages (%.0f KB): uniform %.1f, vertex %.1f, index %.1f, storage %.1f; written but last bound by an older frame %.1f; other protected pages written %.1f; first write %.2f ms after the frame began (mean of %llu frames); writes by time since the frame began: <1 ms %.0f%%, 1-2 %.0f%%, 2-4 %.0f%%, 4-8 %.0f%%, 8-12 %.0f%%, later %.0f%%",
+             (unsigned long long)f, (g_ws_ranges - ranges0) / nf, (g_ws_pages_bound - pages0) / nf, (g_ws_pages_bound - pages0) / nf * 16 / 1024.0, w / nf, w / nf * 16, sum[0] / nf, sum[1] / nf, sum[2] / nf, sum[3] / nf, older / nf, (sum[4] - older) / nf,
+             first_n ? (double)first_sum / first_n * tb.numer / tb.denom / 1e6 : -1.0, (unsigned long long)first_n,
+             w ? 100.0 * bucket[0] / w : 0, w ? 100.0 * bucket[1] / w : 0, w ? 100.0 * bucket[2] / w : 0, w ? 100.0 * bucket[3] / w : 0, w ? 100.0 * bucket[4] / w : 0, w ? 100.0 * bucket[5] / w : 0);
+        frames = 0; older = 0; memset(sum, 0, sizeof sum); memset(bucket, 0, sizeof bucket); first_sum = first_n = 0; ranges0 = g_ws_ranges; pages0 = g_ws_pages_bound; }
+}
 // The same for a dispatch: updates kept past their pass (DM_NVN_UB_LAZY) land before a dispatch that reads or writes their memory through a storage buffer or its indirect arguments, or reads a
 // part of a uniform binding the shadows cannot give (else they would land after it, at the next copy into the encoder it shares, dispatch_enc). Uniform reads they cover take shadows (encode_args)
 static int ubd_conflict_cs(NvShader *cs, uint64_t ind) { return (ind && ubd_hits(ind, ind + 12)) || ubd_conflict_sh(cs, 5); }
@@ -14160,6 +14414,8 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     // Rasterizer discard suppresses fragments, not vertex execution or its storage and image writes (the build gives such a vertex shader main0_discard).
     // Xenoblade Chronicles 3 uses vertex-only work before its skinned-model draws; Metroid Prime Remastered fills its fog volume with image stores from points.
     if (S.rast_discard && (!pr->sh[0] || !pr->sh[0]->discard_fn)) { PD("Z %llu draw skipped: rasterizer discard with no vertex storage or image writes vs=%s", g_stat_pass + !g_enc, pr->sh[0] ? pr->sh[0]->key : "-"); return; }
+    if (wset_on()) wset_draw(pr, dw, di);
+    if (fa_on()) fa_draw(pr, dw, di);
     if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
     vertex_dump(pr->sh[0], dw, di);
     if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
@@ -15541,6 +15797,7 @@ static void clear_ds_tri(const p_clear_ds *c) {
 
 void mtl_exec(const uint8_t *p) {
     if (!g_state_inited) state_reset();
+    g_fa_epoch++;
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
     int trace = dump_all && passdump();   // Normal mode does not check the frame range per operation; the full command position is only used for the designated diagnostic frames
     for (;;) {
@@ -16724,10 +16981,11 @@ static int link_vrr_120(void) { int hz = front_screen_max_fps(); return !g_prese
 static int g_link_mode = 1;   // Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
 static pthread_t g_link_th;
 static int g_link_th_valid;
+qos_class_t dm_host_qos(void);   // hle_thread.c (DM_HOST_QOS)
 static void *link_main(void *arg) {   // Display link thread: started when switching to display-link mode, exits when switching back to 0
     (void)arg;
     pthread_setname_np("nvn-present-link");
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_set_qos_class_self_np(dm_host_qos(), 0);
     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
     pthread_mutex_lock(&g_pq_mu); g_link_owns_layer = 1; while (g_classic_busy) pthread_cond_wait(&g_pq_cv, &g_pq_mu); pthread_mutex_unlock(&g_pq_mu);   // Wait for the present thread to finish handing over the frame it holds
     NvMetalDisplayLinkDelegate *delegate = [NvMetalDisplayLinkDelegate new];
@@ -16801,7 +17059,7 @@ static int g_present_started, g_present_stop;
 static void *present_main(void *arg) {
     (void)arg;
     pthread_setname_np("nvn-present");
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_set_qos_class_self_np(dm_host_qos(), 0);
     qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0; pthread_get_qos_class_np(pthread_self(), &qc, &rp); atomic_store(&g_present_qos, (uint32_t)qc);
     for (;;) {
         pthread_mutex_lock(&g_pq_mu);

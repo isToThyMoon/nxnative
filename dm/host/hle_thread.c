@@ -370,6 +370,15 @@ static void qos_apply(thr_t *t) {   // on the thread itself, holding G (prio and
 }
 // A host helper thread (audio notify / silent sink, vsync, movie decode) created from a guest thread inherits that thread's class; under DM_QOS_MAP it sets its own instead
 void dm_host_helper_qos(qos_class_t q) { if (g_qos_map) pthread_set_qos_class_self_np(q, 0); }
+// DM_HOST_QOS=initiated | default | utility (experiment, for power): the class of the host's own frame threads (queue replay, encode, uniform copy, present), user-interactive otherwise.
+// The performance controller keeps user-interactive threads at a high clock with a low occupancy (Breath of the Wild on an iPhone 17 Pro Max at 60 fps: 3.9 GHz for 4.9 ms of
+// submit work a frame, 42 mJ a frame; the same work at 2.4 GHz under the 30 fps cap, 22 mJ), and a lower class lets it fill more of the frame at a lower clock
+qos_class_t dm_host_qos(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_HOST_QOS"); v = !e ? QOS_CLASS_USER_INTERACTIVE : !strcmp(e, "initiated") ? QOS_CLASS_USER_INITIATED : !strcmp(e, "default") ? QOS_CLASS_DEFAULT : !strcmp(e, "utility") ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE;
+        if (v != QOS_CLASS_USER_INTERACTIVE) LOG("DM_HOST_QOS=%s: the host's frame threads run at QoS %#x", e, v); }
+    return (qos_class_t)v;
+}
 static const char *thr_name(thr_t *t, char *buf, size_t n);
 static void *thread_main(void *p) {
     thr_t *t = p;
