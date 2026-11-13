@@ -7482,6 +7482,10 @@ static unsigned vs_streams(const nvn_refl *rf) {   // the streams the vertex sha
 }
 // Returns the first stream the vertex shader reads (rf) whose non-zero address is in no memory pool, or -1. Such a slot would keep the buffer an earlier draw bound
 // there, so the caller skips the draw, as for an index buffer in no pool; a stream with address 0 reads the zero buffer through the vertex descriptor (ZERO_ATTR)
+enum { FA_K_UNI_FWD = 0 }; static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MTLBuffer> *use); static int g_fa_kind;
+#ifndef FA_COPY_MAX_FWD
+#define FA_COPY_MAX_FWD (512u << 10)
+#endif
 static int bind_vbufs(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf) {
     static struct { uint64_t addr, gpu, gen; } cache[16];
     uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
@@ -7500,6 +7504,7 @@ static int bind_vbufs(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf) {
             }
             cache[s].addr = addr; cache[s].gpu = gpu; cache[s].gen = gen;
         }
+        if (fa_on() && S.vbuf[s].size && S.vbuf[s].size <= FA_COPY_MAX_FWD) { __strong id<MTLBuffer> fb = nil; g_fa_kind = 1; gpu = fa_cbuf(addr, S.vbuf[s].size, gpu, &fb); g_fa_kind = 0; }   // frame ahead: a stream on volatile pages is read from a copy
         enc_r_vbuf(en, VB_SLOT(s), gpu);
     }
     static id<MTLBuffer> zero; static uint64_t zero_gpu;
@@ -11275,8 +11280,11 @@ static uint64_t ub_padded(NvShader *sh, int st, int reg, const p_bind_buf *u, ui
 // - a uniform block on a volatile page is copied into the submission's arena when it is bound (fa_cbuf) and the draw reads the copy, so the page needs no protection;
 // - what the host cannot place yet (a binding that reaches any pool, a compute stage's buffers) sets g_fa_block: the wait then covers that submission as before.
 // A wrong guess costs a wait, never a wrong picture. "[ahead]" lines every 600 frames give the counts. DM_FRAME_AHEAD=ab alternates with the DM_AB phases
-typedef struct { _Atomic uint64_t page, fence; _Atomic uint32_t frame; _Atomic uint8_t vol, prot; } fa_pg;
-enum { FA_PG = 1 << 18, FA_DED = 4096 };
+typedef struct { _Atomic uint64_t page, fence; _Atomic uint32_t frame; _Atomic uint8_t vol, prot, kind; } fa_pg;   // kind: what read it in place last (FA_K_*)
+enum { FA_K_UNI, FA_K_VTX, FA_K_IDX, FA_K_PTR, FA_K_GPUW, FA_K_N };
+static int g_fa_kind;   // the kind of the binding being placed (the submit thread)
+static _Atomic uint64_t g_fa_gate_k[FA_K_N], g_fa_gate_kns[FA_K_N];
+enum { FA_PG = 1 << 18, FA_DED = 4096, FA_COPY_MAX = 512 << 10 };   // FA_COPY_MAX: the largest vertex or index range copied when volatile
 static fa_pg g_fa[FA_PG];
 static int g_fa_mode = -1;
 static _Atomic uint64_t g_fa_floor, g_fa_block, g_fa_gate_n, g_fa_gate_ns, g_fa_gate_late, g_fa_vol_n;
@@ -11331,7 +11339,8 @@ static void fa_gate(uintptr_t lo, uintptr_t hi) {
         if (f > atomic_load(&g_fence) || f <= atomic_load(&g_done) || (sub && atomic_load(&e->frame) == cur)) continue;
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int k = 0;
         for (; k < 30000 && atomic_load(&g_done) < f; k++) usleep(100);
-        atomic_fetch_add(&g_fa_gate_n, 1); atomic_fetch_add(&g_fa_gate_ns, clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0); if (k >= 30000) atomic_fetch_add(&g_fa_gate_late, 1);
+        uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; unsigned kd = atomic_load_explicit(&e->kind, memory_order_relaxed) % FA_K_N;
+        atomic_fetch_add(&g_fa_gate_n, 1); atomic_fetch_add(&g_fa_gate_ns, dt); atomic_fetch_add(&g_fa_gate_k[kd], 1); atomic_fetch_add(&g_fa_gate_kns[kd], dt); if (k >= 30000) atomic_fetch_add(&g_fa_gate_late, 1);
     }
 }
 static void fa_block(void) { uint64_t f = atomic_load(&g_fence) + 1; if (atomic_load(&g_fa_block) != f) { atomic_store(&g_fa_block, f); g_fa_blocks++; } }
@@ -11346,7 +11355,7 @@ static void fa_bind(uint64_t lo, uint64_t hi) {
     int need = 0; g_fa_binds++;
     for (uint64_t pg = lo >> 14; pg <= (hi - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 1);
         if (!e) { g_fa_full++; fa_block(); return; }
-        atomic_store(&e->fence, f); atomic_store(&e->frame, fr);
+        atomic_store(&e->fence, f); atomic_store(&e->frame, fr); atomic_store_explicit(&e->kind, (uint8_t)g_fa_kind, memory_order_relaxed);
         if (!atomic_exchange(&e->prot, 1)) need = 1; }   // set before the protection lands: a write after it clears the flag again in the gate
     if (need) { uint64_t a = lo & ~0x3fffull, b = (hi + 0x3fff) & ~0x3fffull;
         if (!nvn_dirty_tracked((const void *)(uintptr_t)lo, (size_t)(hi - lo))) { fa_block(); for (uint64_t pg = lo >> 14; pg <= (hi - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e) atomic_store(&e->prot, 0); } return; }
@@ -11361,7 +11370,7 @@ static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MT
     for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && atomic_load_explicit(&e->vol, memory_order_relaxed)) { vol = 1; break; } }
     // The copy is the memory as the CPU sees it now. What the GPU still has to write there (an inline update landing by a blit, a storage buffer write, a readback: the last
     // frame's, now that its end is not waited for) is not in it yet: such a block is read in place, in the GPU's order, as before
-    if (!vol || g_sbw_over || sbw_hits(addr, addr + ul) || gw_live(addr, addr + ul) || hw_live(addr, addr + ul) || !nvn_host_readable(addr, ul)) { if (vol) g_fa_inplace_vol++; fa_bind(addr, addr + ul); return gpu; }
+    if (!vol || g_sbw_over || sbw_hits(addr, addr + ul) || gw_live(addr, addr + ul) || hw_live(addr, addr + ul) || !nvn_host_readable(addr, ul)) { int k0 = g_fa_kind; if (vol) { g_fa_inplace_vol++; g_fa_kind = FA_K_GPUW; } fa_bind(addr, addr + ul); g_fa_kind = k0; return gpu; }
     unsigned k = (unsigned)(((addr * 0x9E3779B97F4A7C15ull) ^ (ul * 0xC2B2AE3D27D4EB4Full)) >> 52) & (FA_DED - 1);
     if (ded[k].addr == addr && ded[k].ul == ul && ded[k].ep == g_fa_epoch && ded[k].ver == g_ubd_ver) { *use = (__bridge id<MTLBuffer>)ded[k].buf; return ded[k].gpu; }
     id<MTLBuffer> ab; size_t o = arena_alloc((size_t)ul, &ab);
@@ -11372,9 +11381,10 @@ static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MT
 }
 // A draw's vertex, index and indirect buffers are read in place (its shaders' buffers are placed where their arguments are encoded: cbuf_slot, encode_args_)
 static void fa_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
-    for (int s_ = 0; s_ < 16; s_++) if (S.vbuf[s_].address) fa_bind(S.vbuf[s_].address, S.vbuf[s_].address + S.vbuf[s_].size);
-    if (di && di->ibuf) fa_bind(di->ibuf, di->ibuf + (uint64_t)di->count * 4);
+    g_fa_kind = FA_K_VTX; for (int s_ = 0; s_ < 16; s_++) if (S.vbuf[s_].address && (S.vbuf[s_].size > FA_COPY_MAX || !S.vbuf[s_].size)) fa_bind(S.vbuf[s_].address, S.vbuf[s_].address + (S.vbuf[s_].size ? S.vbuf[s_].size : 1));   // smaller ones: bind_vbufs
+    g_fa_kind = FA_K_IDX; if (di && di->ibuf && (di->ind || (uint64_t)di->count * 4 > FA_COPY_MAX)) fa_bind(di->ibuf, di->ibuf + (uint64_t)di->count * 4);
     uint64_t ind = dw ? dw->ind : di ? di->ind : 0; if (ind) fa_bind(ind, ind + 32);
+    g_fa_kind = FA_K_UNI;
     (void)pr;
 }
 // The GPU has not finished the frames before the one being replayed: it is the bottleneck, and the acquire does not wait for a display tick (hle_nvn.c), so the next frame's
@@ -11385,8 +11395,8 @@ static void fa_frame(uint64_t f) {   // the submit thread, when the frame it rep
     atomic_store(&g_fa_floor, atomic_load(&g_fence));
     static uint64_t p[12]; uint64_t v[12] = {g_fa_inplace_vol, atomic_load(&g_fa_ahead_n), atomic_load(&g_fa_real_n), g_fa_snap_n, g_fa_snap_bytes, g_fa_binds, g_fa_prot, atomic_load(&g_fa_gate_n), atomic_load(&g_fa_gate_ns), g_fa_blocks, atomic_load(&g_fa_gate_late), atomic_load(&g_fa_skip)};
     if (f && !(f % 600)) { double n = 600.0;
-        MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB), on volatile pages but read in place for a GPU write still to come %.1f; ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); submissions the wait must cover %.2f; acquires that skipped the display tick %.2f; volatile pages %llu; table full %llu, gate timeouts %llu",
-             (unsigned long long)f, (v[1] - p[1]) / n, (v[2] - p[2]) / n, (v[3] - p[3]) / n, (v[4] - p[4]) / n / 1024.0, (v[0] - p[0]) / n, (v[5] - p[5]) / n, (v[6] - p[6]) / n, (v[7] - p[7]) / n, (v[8] - p[8]) / n / 1e6, (v[9] - p[9]) / n, (v[11] - p[11]) / n,
+        MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB), on volatile pages but read in place for a GPU write still to come %.1f; ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); by what read the page in place: uniform %llu, vertex %llu, index %llu, pointer or storage %llu, a block with a GPU write to come %llu (totals); submissions the wait must cover %.2f; acquires that skipped the display tick %.2f; volatile pages %llu; table full %llu, gate timeouts %llu",
+             (unsigned long long)f, (v[1] - p[1]) / n, (v[2] - p[2]) / n, (v[3] - p[3]) / n, (v[4] - p[4]) / n / 1024.0, (v[0] - p[0]) / n, (v[5] - p[5]) / n, (v[6] - p[6]) / n, (v[7] - p[7]) / n, (v[8] - p[8]) / n / 1e6, (unsigned long long)atomic_load(&g_fa_gate_k[0]), (unsigned long long)atomic_load(&g_fa_gate_k[1]), (unsigned long long)atomic_load(&g_fa_gate_k[2]), (unsigned long long)atomic_load(&g_fa_gate_k[3]), (unsigned long long)atomic_load(&g_fa_gate_k[4]), (v[9] - p[9]) / n, (v[11] - p[11]) / n,
              (unsigned long long)atomic_load(&g_fa_vol_n), (unsigned long long)g_fa_full, (unsigned long long)(v[10] - p[10]));
         memcpy(p, v, sizeof p); }
 }
@@ -11676,8 +11686,9 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             void *mb; uint64_t mo, gpu;
             if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); if (b->rw && b->kind == NVN_RB_SBUFP && !(reg < 32 && (sh->sb_ro >> reg & 1))) sbw_note(u->addr, sbw_len(u->size, mb, mo), SBW_GPU);   // cb_extent.tsv: slots the shader never writes
                 if (fa_on()) {   // frame ahead: a block the shader only reads is copied when its pages are volatile (as a uniform block, fa_cbuf), anything else is read in place
-                    if (!b->rw && u->size && u->size <= (256u << 10)) { __strong id<MTLBuffer> fb = (__bridge id<MTLBuffer>)mb; uint64_t g2 = fa_cbuf(u->addr, u->size, gpu, &fb); if (g2 != gpu) { slots[aid] = g2; USE(fb, MTLResourceUsageRead); } }
-                    else fa_bind(u->addr, u->addr + (u->size ? u->size : 1)); } }
+                    g_fa_kind = FA_K_PTR; if (!b->rw && u->size && u->size <= (256u << 10)) { __strong id<MTLBuffer> fb = (__bridge id<MTLBuffer>)mb; uint64_t g2 = fa_cbuf(u->addr, u->size, gpu, &fb); if (g2 != gpu) { slots[aid] = g2; USE(fb, MTLResourceUsageRead); } }
+                    else fa_bind(u->addr, u->addr + (u->size ? u->size : 1));
+                    g_fa_kind = FA_K_UNI; } }
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufp reg%d %s addr=%#llx size=%llu %s", g_stat_pass, nvn_stage, reg, u && u->addr ? "real" : "dummy", u ? (unsigned long long)u->addr : 0ull, u ? (unsigned long long)u->size : 0ull, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_SBUFU) {   // B: a storage buffer whose GPU address the game keeps in its own uniform buffer (Monster Hunter Rise's compute shaders: c3 + 0x38); read like a bindless handle
@@ -14759,7 +14770,9 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
         void *mb; uint64_t mo;
         uint64_t gpu;
         if (!mtl_gpu_addr(di->ibuf, (uint64_t)di->count * (di->itype == 1 ? 2 : 4), &mb, &mo, &gpu)) { RED_ONCE(22, "index buffer is in no memory pool"); return; }
-        if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ((__bridge id<MTLBuffer>)mb).length - mo,
+        uint64_t ilen = ((__bridge id<MTLBuffer>)mb).length - mo, ibytes = (uint64_t)di->count * (di->itype == 1 ? 2 : 4);
+        if (fa_on() && ibytes && ibytes <= FA_COPY_MAX) { __strong id<MTLBuffer> fb = nil; g_fa_kind = FA_K_IDX; uint64_t g2 = fa_cbuf(di->ibuf, ibytes, gpu, &fb); g_fa_kind = FA_K_UNI; if (g2 != gpu) { gpu = g2; ilen = (ibytes + 255) & ~255ull; } }   // the arena block is that long
+        if (di->count) enc_r_draw_indexed(en, mp, di->count, di->itype == 1 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32, gpu, ilen,
                 di->instances ? di->instances : 1, di->base_vertex, di->base_instance);
     }
     if (g_rt_range_pending) { PD("j rt_level_range pass=%llu vc=%u", g_stat_pass, (unsigned)(dw ? dw->count : di->count)); g_rt_range_pending=0; }
