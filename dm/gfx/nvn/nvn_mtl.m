@@ -11289,8 +11289,22 @@ __attribute__((noinline)) static int fa_mode_init(void) {
     return g_fa_mode;
 }
 static inline int fa_on(void) { int m = g_fa_mode < 0 ? fa_mode_init() : g_fa_mode; return m && sw_on(m); }
-// DM_FRAME_AHEAD_GMEM=trust (test only, not sound): a shader that reaches any pool does not hold the wait, to try the pacing before those reads are kept by page
-static int fa_gmem_trust(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAME_AHEAD_GMEM"); v = e && !strcmp(e, "trust"); if (v) MLOG("DM_FRAME_AHEAD_GMEM=trust: shaders that reach any pool do not hold the frame-ahead wait (test only: their reads are not kept)"); } return v; }
+// DM_FRAME_AHEAD_GMEM: what a compute shader reads through the raw pool table. <reg>:<bytes> = only the first <bytes> of its uniform slot <reg> (Breath of the Wild's 101
+// effect kernels, 12:588: the translator could not prove on every path that four loads at fixed offsets up to 588 stay in slot 12, so they keep the table as a fallback
+// they take only when the slot is bound shorter); then that range is read in place and tracked when the slot is shorter, and nothing else holds the wait.
+// trust = nothing is kept (test only, not sound). Unset: such a shader reaches any pool and its submission gets the full wait
+static int g_fa_gm_reg = -1, g_fa_gm_bytes; static void fa_bind(uint64_t lo, uint64_t hi);
+static int fa_gmem_trust(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAME_AHEAD_GMEM"); v = e && !strcmp(e, "trust");
+        if (e && !v && sscanf(e, "%d:%d", &g_fa_gm_reg, &g_fa_gm_bytes) == 2 && g_fa_gm_reg >= 0 && g_fa_gm_reg < 16 && g_fa_gm_bytes > 0) MLOG("DM_FRAME_AHEAD_GMEM: compute shaders read the raw pool table only within the first %d bytes of uniform slot %d", g_fa_gm_bytes, g_fa_gm_reg); else g_fa_gm_reg = -1;
+        if (v) MLOG("DM_FRAME_AHEAD_GMEM=trust: shaders that reach any pool do not hold the frame-ahead wait (test only: their reads are not kept)"); } return v; }
+// A raw pool table binding of the stage being encoded: 1 when the wait must cover the submission
+static int fa_gmem(int nvn_stage) {
+    if (fa_gmem_trust()) return 0;
+    if (g_fa_gm_reg < 0 || nvn_stage != 5) return 1;
+    const p_bind_buf *u = &S.ubo[5][g_fa_gm_reg]; if (!u->addr) return 1;
+    if (u->size < (uint64_t)g_fa_gm_bytes) fa_bind(u->addr, u->addr + (uint64_t)g_fa_gm_bytes);   // the part past the binding is reached through the table, in place
+    return 0;
+}
 static fa_pg *fa_find(uint64_t pg, int make) {
     unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 46) & (FA_PG - 1);
     for (int i = 0; i < 32; i++, h = (h + 1) & (FA_PG - 1)) {
@@ -11687,7 +11701,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             USE(cb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_GMEM || b->kind == NVN_RB_GMEML) {   // B: the memory pool table for addresses traced to no storage buffer (gmem_map), and the write log of those stores (gml_take)
             if (!raw_map) raw_map = gmem_map();   // the log and the shader use the same table even if a pool comes in during the encode
-            if (fa_on() && !fa_gmem_trust()) fa_block();   // reaches any pool: the frame-ahead wait covers this submission
+            if (fa_on() && fa_gmem(nvn_stage)) fa_block();   // reaches any pool: the frame-ahead wait covers this submission
             slots[aid] = b->kind == NVN_RB_GMEM ? raw_map.gpuAddress : gml_take(raw_map);
             if (b->kind == NVN_RB_GMEM) gmem_aid = aid; else gml_taken = 1;
             if (bl && b->kind == NVN_RB_GMEM) PD("B %llu st%d gmem %s", g_stat_pass, nvn_stage, b->rw ? "rw" : "ro");
