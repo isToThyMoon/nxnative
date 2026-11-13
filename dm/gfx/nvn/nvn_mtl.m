@@ -13974,17 +13974,23 @@ static int csh_draw_reads(NvProg *pr, const p_draw *dw, const p_draw_idx *di, cs
     return 1;
 }
 // A dispatch at its place in the stream (S as it is there): its storage buffers (counted as written), and whether it samples a colour attachment of the pass (1), only the depth (2)
+static char g_csh_why[96];   // why csh_cs refused the last dispatch (logged once per shader)
+#define CSH_NO(...) do { snprintf(g_csh_why, sizeof g_csh_why, __VA_ARGS__); return 0; } while (0)
 static int csh_cs(NvShader *cs, const p_dispatch *dp, csh_rng *w, int *nw, int *depth) {
-    if (!cs || cs->builtin || dp->ind || cs->rf.bindless || cs->rf.dyn) return 0;
+    if (!cs) CSH_NO("no shader"); if (cs->builtin) CSH_NO("builtin"); if (dp->ind) CSH_NO("indirect"); if (cs->rf.bindless) CSH_NO("bindless"); if (cs->rf.dyn) CSH_NO("dyn");
     for (int i = 0; i < cs->rf.nb; i++) { const nvn_rbind *b = &cs->rf.b[i];
         switch (b->kind) {
-            case NVN_RB_SBUFP: if (b->reg >= 16 || csh_attachment_hit(S.ssbo[5][b->reg].addr, S.ssbo[5][b->reg].size) || !csh_add(w, nw, S.ssbo[5][b->reg].addr, S.ssbo[5][b->reg].size)) return 0; break;
-            case NVN_RB_CBUF: case NVN_RB_UBOP: if (b->reg >= 16 || csh_attachment_hit(S.ubo[5][b->reg].addr, S.ubo[5][b->reg].size)) return 0; break;
-            case NVN_RB_SBUFU: case NVN_RB_SBUFQ: case NVN_RB_IMG: case NVN_RB_TEXU: case NVN_RB_TEXD: case NVN_RB_TEXA: case NVN_RB_GMEM: return 0;
+            case NVN_RB_SBUFP: if (b->reg >= 16) CSH_NO("sbufp reg %d", b->reg); if (csh_attachment_hit(S.ssbo[5][b->reg].addr, S.ssbo[5][b->reg].size)) CSH_NO("sbufp %d hits attachment", b->reg); if (!csh_add(w, nw, S.ssbo[5][b->reg].addr, S.ssbo[5][b->reg].size)) CSH_NO("sbufp %d range list full", b->reg); break;
+            case NVN_RB_CBUF: case NVN_RB_UBOP: if (b->reg >= 16) CSH_NO("ubo reg %d", b->reg); if (csh_attachment_hit(S.ubo[5][b->reg].addr, S.ubo[5][b->reg].size)) CSH_NO("ubo %d hits attachment", b->reg); break;
+            // Read-only global memory through the memory pool table (gmem_map without rw): the loads the translator could not trace to one storage buffer. It writes nothing, and
+            // the draws it passes write no memory (csh_draw_reads), so it reads the same bytes ahead of them. Breath of the Wild's GPU particles (NintendoWare VFX, cs_effect.bin)
+            // all have one, so none moved; with this about 4 of their ~28 dispatches a frame run ahead (iPhone 17 Pro Max), the rest sample depth the pass already wrote (g_csh_stop[7])
+            case NVN_RB_GMEM: if (b->rw) CSH_NO("writable global memory"); break;
+            case NVN_RB_SBUFU: case NVN_RB_SBUFQ: case NVN_RB_IMG: case NVN_RB_TEXU: case NVN_RB_TEXD: case NVN_RB_TEXA: CSH_NO("binding kind %d reg %d", (int)b->kind, (int)b->reg);
             case NVN_RB_TEX: case NVN_RB_TBUF: { uint64_t h = tex_slot_h(S.tex[5], S.img[5], b->reg); int tid = (int)(h & 0xfffff); if (!tid) break;
                 os_unfair_lock_lock(&g_rmu); tex_t t = tid < g_ntreg && g_treg[tid].ok ? g_treg[tid].t : (tex_t){0}; os_unfair_lock_unlock(&g_rmu);
-                if (!t.serial) return 0;
-                for (int k = 0; k < R.rt.n && k < 8; k++) if (tex_storage_overlap(&t, R.rt.color[k])) return 0;
+                if (!t.serial) CSH_NO("tex reg %d unregistered", (int)b->reg);
+                for (int k = 0; k < R.rt.n && k < 8; k++) if (tex_storage_overlap(&t, R.rt.color[k])) CSH_NO("tex reg %d samples colour attachment %d", (int)b->reg, k);
                 if (tex_storage_overlap(&t, R.rt.depth)) *depth = 1;
                 break; }
             default: break; } }
@@ -14035,7 +14041,10 @@ static void cs_hoist_try(NvProg *pr0, const p_draw *dw0, const p_draw_idx *di0) 
         if (hq.op == OP_DISPATCH) {
             const p_dispatch *dp = aq; __unsafe_unretained NvShader *cs = S.cprog && prog_get(S.cprog) ? prog_get(S.cprog)->sh[5] : nil;
             static csh_rng wr[CSH_RN]; int nwr = 0, depth = 0;
-            if (!csh_cs(cs, dp, wr, &nwr, &depth)) { g_csh_stop[2]++; break; }
+            if (!csh_cs(cs, dp, wr, &nwr, &depth)) { g_csh_stop[2]++;
+                { static char seen[64][20]; static int ns; const char *key = cs ? cs->key : "-"; int k = 0; for (; k < ns; k++) if (!strncmp(seen[k], key, 19)) break;
+                  if (k == ns && ns < 64) { strncpy(seen[ns++], key, 19); MLOG("[cshoist] dispatch %s not moved ahead: %s", key, g_csh_why); } }
+                break; }
             if (depth && dwrote) { g_csh_stop[7]++; break; }   // it would miss depth the draws before it wrote
             if (csh_hit(wr, nwr, rd, nrd)) { g_csh_stop[3]++; break; }   // the draws before it read what it writes
             if (g_csh_n >= CSH_MAX) { g_csh_stop[4]++; break; }
