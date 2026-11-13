@@ -11364,7 +11364,7 @@ static void fa_bind(uint64_t lo, uint64_t hi) {
 }
 // The GPU address a uniform block of [addr, addr + ul) is read at: in place (gpu) when none of its pages is volatile, else a copy made now in the submission's arena
 static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MTLBuffer> *use) {
-    static struct { uint64_t addr, ul, ep, ver, fence, gpu; void *buf; } ded[FA_DED];   // gpu 0: read in place (remembered for the commit)
+    static struct { uint64_t addr, ul, ep, ver, fence, gpu; void *buf; int npend; uint32_t pgen; } ded[FA_DED];   // gpu 0: read in place (remembered for the commit)
     if (!ul) return gpu;
     int vol = 0;
     for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && atomic_load_explicit(&e->vol, memory_order_relaxed)) { vol = 1; break; } }
@@ -11373,8 +11373,12 @@ static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MT
     // (a segment boundary commits; the next segment's draws would read an arena already recycled)
     uint64_t fn = atomic_load_explicit(&g_fence, memory_order_relaxed);
     unsigned k = (unsigned)(((addr * 0x9E3779B97F4A7C15ull) ^ (ul * 0xC2B2AE3D27D4EB4Full)) >> 52) & (FA_DED - 1);
-    if (ded[k].addr == addr && ded[k].ul == ul && ded[k].ep == g_fa_epoch && ded[k].ver == g_ubd_ver && ded[k].fence == fn) { if (!ded[k].gpu) return gpu; *use = (__bridge id<MTLBuffer>)ded[k].buf; return ded[k].gpu; }
-    ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = g_fa_epoch; ded[k].ver = g_ubd_ver; ded[k].fence = fn; ded[k].gpu = 0; ded[k].buf = NULL;
+    if (ded[k].addr == addr && ded[k].ul == ul && ded[k].ep == g_fa_epoch && ded[k].ver == g_ubd_ver && ded[k].fence == fn && ded[k].npend == g_npend && ded[k].pgen == g_pend_gen) { if (!ded[k].gpu) return gpu; *use = (__bridge id<MTLBuffer>)ded[k].buf; return ded[k].gpu; }
+    ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = g_fa_epoch; ded[k].ver = g_ubd_ver; ded[k].fence = fn; ded[k].gpu = 0; ded[k].buf = NULL; ded[k].npend = g_npend; ded[k].pgen = g_pend_gen;
+    // The block as the GPU will read it at this point: memory, with the inline updates of submissions still running and of this one laid over it (ubp_get: the host has
+    // their bytes, the game's memory gets them only when their blit has run). So a block the game updates inline every frame is copied too, and its page needs no
+    // protection; ubp_get refuses what the CPU cannot know (a copy, a fill or a shader's store still to come)
+    { uint64_t g; const uint8_t *c; if (ul <= UBP_MAX_BYTES && ubp_get(addr, addr + ul, &g, &c)) { g_fa_snap_n++; g_fa_snap_bytes += ul; ded[k].gpu = g; ded[k].buf = (__bridge void *)*use; return g; } }
     // The copy is the memory as the CPU sees it now. What the GPU still has to write there (an inline update landing by a blit, a storage buffer write, a readback: the last
     // frame's, now that its end is not waited for) is not in it yet: such a block is read in place, in the GPU's order, as before
     if (!vol || g_sbw_over || sbw_hits(addr, addr + ul) || gw_live(addr, addr + ul) || hw_live(addr, addr + ul) || !nvn_host_readable(addr, ul)) { int k0 = g_fa_kind; if (vol) { g_fa_inplace_vol++; g_fa_kind = FA_K_GPUW; } fa_bind(addr, addr + ul); g_fa_kind = k0; return gpu; }
