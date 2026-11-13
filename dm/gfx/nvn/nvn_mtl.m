@@ -2389,9 +2389,9 @@ static void *gpu_fill_thread(void *arg) {
 // GPU supplied (frame ahead: frame time = GPU time for four minutes, the clock at its floor); it raises it within 30 frames for the fill. The probe's fixed shading
 // (gpu_probe_frame, run every 10 frames here) measures the clock whatever the scene: its shortest time so far is the full clock (a fill of 90 frames at the start finds it),
 // and the ratio of the shortest of the last three to it is the level (1 = full; Breath of the Wild holds 60 fps at 1.5-2, is late from about 3, and the floor is 4.7).
-// The fill runs while the level is above <high> (default 2.3) or the game's GPU time (a running mean) is above 10.5 ms, unless the clock is already full (below 1.2: the
-// scene costs that much, a fill gains nothing) or the game's GPU time is under 7 ms (a menu: a low clock is right); it stops when the level is under <low> (2.0) and the GPU
-// time under 9 ms, and runs 20 frames at least. "[gpukeep]" lines every 600 frames. DM_GPU_FILL=1 / ab is the fill alone, always on or by DM_AB phase
+// The fill starts when the level is above <high> (default 2.3) or the game's GPU time (a running mean) is above 12 ms, unless the clock is already full (below 1.2: the
+// scene costs that much, a fill gains nothing) or the game's GPU time is under 7 ms (a menu: a low clock is right); it runs 20 frames at least and stops when the level is
+// under <low> (2.0). "[gpukeep]" lines every 600 frames. DM_GPU_FILL=1 / ab is the fill alone, always on or by DM_AB phase
 static _Atomic uint32_t g_probe_us[3]; static _Atomic uint32_t g_probe_i, g_probe_min_us;   // the last three probe shading times and the shortest ever (microseconds)
 static long g_probe_keep_every;   // the keeper's probe period (0 = off)
 static void gpu_fill_frame(uint64_t f) {
@@ -2400,7 +2400,7 @@ static void gpu_fill_frame(uint64_t f) {
         const char *e = getenv("DM_GPU_KEEP"); keep = e && atof(e) > 0;
         if (keep) { double a = 0, b = 0; int n = sscanf(e, "%lf,%lf", &a, &b); if (n >= 2 && a > 1.2 && b > 1.0 && b < a) { hi = a; lo = b; }
             g_probe_keep_every = 10;
-            MLOG("DM_GPU_KEEP: the fill holds the GPU clock: it runs above level %.2f of the probe's full-clock time or 10.5 ms of GPU time, until level %.2f", hi, lo); } }
+            MLOG("DM_GPU_KEEP: the fill holds the GPU clock: it starts above level %.2f of the probe's full-clock time or 12 ms of GPU time and runs until level %.2f", hi, lo); } }
     if (!mode && !keep) return;
     if (keep) {
         for (uint64_t k = f > 2 ? f - 2 : 0; k > seen && k + 12 > f; k--) { double g = mtl_gpu_ms(k); if (g > 0) { ema = ema > 0 ? ema + 0.3 * (g - ema) : g; seen = k; break; } }
@@ -2409,10 +2409,12 @@ static void gpu_fill_frame(uint64_t f) {
         double r = base && est ? (double)est / base : 0;   // 0: not measured yet
         if (!calib_until && f >= 240) calib_until = f + 90;   // the full clock's time: once, early (the title screen)
         int calib = calib_until && f < calib_until;
-        if (!state) { if (!calib && r > 0 && r >= 1.2 && ema > 7.0 && (r > hi || ema > 10.5)) { state = 1; run = 0; kicks++; } }
+        if (!state) { if (!calib && r > 0 && r >= 1.2 && ema > 7.0 && (r > hi || ema > 12.0)) { state = 1; run = 0; kicks++; } }
         else { filled++; run++;
-            if (run >= 20) { if (r > 0 && r < 1.2) { state = 0; if (ema > 10.5) atmax_stops++; }   // the clock is full: nothing more to gain
-                             else if (r > 0 && r < lo && ema < 9.0) state = 0;
+            // It stops by the clock alone: the fill itself adds about 1.3 ms to the game's GPU time, so a stop that also asked for a short GPU time kept the fill on for
+            // 55-72% of the frames (and the system then lowered the CPU clock: submit 5 → 11 ms, 54-58 fps)
+            if (run >= 20) { if (r > 0 && r < 1.2) { state = 0; if (ema > 12.0) atmax_stops++; }   // the clock is full: nothing more to gain
+                             else if (r > 0 && r < lo) state = 0;
                              else if (ema <= 7.0) state = 0; } }
         if (f && !(f % 600)) MLOG("[gpukeep] up to frame %llu: clock level %.2f (probe %.3f ms, full clock %.3f ms), game GPU running mean %.2f ms; %llu fills started, %llu frames filled in all, %llu stopped at full clock with the frame still long, thermal %d",
                                   (unsigned long long)f, r, est / 1e3, base / 1e3, ema, (unsigned long long)kicks, (unsigned long long)filled, (unsigned long long)atmax_stops, (int)NSProcessInfo.processInfo.thermalState);
