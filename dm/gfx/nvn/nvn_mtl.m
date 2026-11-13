@@ -2379,34 +2379,45 @@ static void *gpu_fill_thread(void *arg) {
         if (!atomic_load(&g_fill_want)) { usleep(2000); continue; }
         dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor new]; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionStore; rp.colorAttachments[0].texture = t[k & 1];
-        id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding];
+        id<MTLCommandBuffer> cb = [g_q commandBuffer]; id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; for (int i = 0; i < 6; i++) [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding];   // six draws a buffer: a sixth of the command buffers, whose CPU cost made the system lower the CPU clock under a constant fill
         [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { (void)c; atomic_fetch_add(&g_fill_n, 1); dispatch_semaphore_signal(sem); }];
         [cb commit]; } }
     return NULL;
 }
-// DM_GPU_KEEP=1 or =<on ms>,<off ms> (experiment, iPhone): holds the GPU's clock up with the fill. The iPhone's GPU controller lowers the clock a level about every second while the GPU is
-// idle part of each frame (the probe's shading: 0.33 ms at full clock, 0.53-0.66 while Breath of the Wild holds 60 fps at 8 ms of GPU time, then 0.82, 1.07 and 1.54 ms, where the same
-// frame takes 22 ms), and once a frame is late the game shows frames for two vsyncs, the GPU is idle for longer and the clock never comes back: 33 fps on a cool phone. The fill makes
-// the controller raise the clock within 30 frames. It runs while the game's GPU time (a running mean of the newest frames whose command buffers completed) is above <on ms> (default
-// 10.5) and stops below <off ms> (default 9.0), so the clock stays at the level where the game's work fills about 60% of the frame. A fill that has run for 120 frames in a row
-// without the GPU time falling below <on ms> is a scene that costs that much at full clock, and pauses for 5 s. "[gpukeep]" lines: every 600 frames the fills started, the frames
-// filled and the pauses. DM_GPU_FILL=1 / ab is the fill alone, always on or by DM_AB phase.
+// DM_GPU_KEEP=1 or =<high>,<low> (iPhone): holds the GPU's clock where the game's frame fits, with the fill, by the clock itself. The iPhone's GPU controller lowers the clock a
+// level about every second while the GPU is idle part of each frame, also when the game's work then no longer fits the frame, and does not raise it for a game that keeps the
+// GPU supplied (frame ahead: frame time = GPU time for four minutes, the clock at its floor); it raises it within 30 frames for the fill. The probe's fixed shading
+// (gpu_probe_frame, run every 10 frames here) measures the clock whatever the scene: its shortest time so far is the full clock (a fill of 90 frames at the start finds it),
+// and the ratio of the shortest of the last three to it is the level (1 = full; Breath of the Wild holds 60 fps at 1.5-2, is late from about 3, and the floor is 4.7).
+// The fill runs while the level is above <high> (default 2.3) or the game's GPU time (a running mean) is above 10.5 ms, unless the clock is already full (below 1.2: the
+// scene costs that much, a fill gains nothing) or the game's GPU time is under 7 ms (a menu: a low clock is right); it stops when the level is under <low> (2.0) and the GPU
+// time under 9 ms, and runs 20 frames at least. "[gpukeep]" lines every 600 frames. DM_GPU_FILL=1 / ab is the fill alone, always on or by DM_AB phase
+static _Atomic uint32_t g_probe_us[3]; static _Atomic uint32_t g_probe_i, g_probe_min_us;   // the last three probe shading times and the shortest ever (microseconds)
+static long g_probe_keep_every;   // the keeper's probe period (0 = off)
 static void gpu_fill_frame(uint64_t f) {
-    static int mode = -1, keep, started, state, run; static double on_ms = 10.5, off_ms = 9.0, ema; static uint64_t hold_until, kicks, pauses, filled, seen;
+    static int mode = -1, keep, started, state, run; static double hi = 2.3, lo = 2.0, ema; static uint64_t kicks, filled, seen, atmax_stops, calib_until;
     if (mode < 0) { mode = sw_mode("DM_GPU_FILL", 0); if (mode) MLOG("DM_GPU_FILL: the GPU is kept busy between the game's submissions (experiment)");
         const char *e = getenv("DM_GPU_KEEP"); keep = e && atof(e) > 0;
-        if (keep) { double a = 0, b = 0; int n = sscanf(e, "%lf,%lf", &a, &b); if (n >= 1 && a > 1.5) on_ms = a; if (n >= 2 && b > 0 && b < on_ms) off_ms = b; else if (off_ms >= on_ms) off_ms = on_ms * 0.85;
-            MLOG("DM_GPU_KEEP: the fill runs while the game's GPU time is above %.1f ms, until it is below %.1f ms (experiment)", on_ms, off_ms); } }
+        if (keep) { double a = 0, b = 0; int n = sscanf(e, "%lf,%lf", &a, &b); if (n >= 2 && a > 1.2 && b > 1.0 && b < a) { hi = a; lo = b; }
+            g_probe_keep_every = 10;
+            MLOG("DM_GPU_KEEP: the fill holds the GPU clock: it runs above level %.2f of the probe's full-clock time or 10.5 ms of GPU time, until level %.2f", hi, lo); } }
     if (!mode && !keep) return;
     if (keep) {
         for (uint64_t k = f > 2 ? f - 2 : 0; k > seen && k + 12 > f; k--) { double g = mtl_gpu_ms(k); if (g > 0) { ema = ema > 0 ? ema + 0.3 * (g - ema) : g; seen = k; break; } }
-        if (!state) { if (ema > on_ms && f >= hold_until) { state = 1; run = 0; kicks++; } }
+        uint32_t base = atomic_load(&g_probe_min_us), p0 = atomic_load(&g_probe_us[0]), p1 = atomic_load(&g_probe_us[1]), p2 = atomic_load(&g_probe_us[2]);
+        uint32_t est = p0; if (p1 && p1 < est) est = p1; if (p2 && p2 < est) est = p2;
+        double r = base && est ? (double)est / base : 0;   // 0: not measured yet
+        if (!calib_until && f >= 240) calib_until = f + 90;   // the full clock's time: once, early (the title screen)
+        int calib = calib_until && f < calib_until;
+        if (!state) { if (!calib && r > 0 && r >= 1.2 && ema > 7.0 && (r > hi || ema > 10.5)) { state = 1; run = 0; kicks++; } }
         else { filled++; run++;
-            if (ema < off_ms) state = 0;
-            else if (run >= 120 && ema > on_ms) { state = 0; pauses++; hold_until = f + 300; } }
-        if (f && !(f % 600)) MLOG("[gpukeep] up to frame %llu: %llu fills started, %llu frames filled in all, %llu pauses, GPU running mean %.2f ms, thermal %d", (unsigned long long)f, (unsigned long long)kicks, (unsigned long long)filled, (unsigned long long)pauses, ema, (int)NSProcessInfo.processInfo.thermalState);
-    }
-    atomic_store(&g_fill_want, state || (mode && sw_on(mode)));
+            if (run >= 20) { if (r > 0 && r < 1.2) { state = 0; if (ema > 10.5) atmax_stops++; }   // the clock is full: nothing more to gain
+                             else if (r > 0 && r < lo && ema < 9.0) state = 0;
+                             else if (ema <= 7.0) state = 0; } }
+        if (f && !(f % 600)) MLOG("[gpukeep] up to frame %llu: clock level %.2f (probe %.3f ms, full clock %.3f ms), game GPU running mean %.2f ms; %llu fills started, %llu frames filled in all, %llu stopped at full clock with the frame still long, thermal %d",
+                                  (unsigned long long)f, r, est / 1e3, base / 1e3, ema, (unsigned long long)kicks, (unsigned long long)filled, (unsigned long long)atmax_stops, (int)NSProcessInfo.processInfo.thermalState);
+        atomic_store(&g_fill_want, state || calib || (mode && sw_on(mode)));
+    } else atomic_store(&g_fill_want, mode && sw_on(mode));
     if (!started) { started = 1; pthread_t th; pthread_create(&th, NULL, gpu_fill_thread, NULL); pthread_detach(th); }
 }
 // DM_GPU_LOAD=<n> (test): each frame n draws of the probe's shading on a 512 x 512 target run in a command buffer of their own, so the GPU has more to do than the game gives it:
@@ -2426,7 +2437,8 @@ static void gpu_load_frame(void) {
 static void gpu_probe_frame(uint64_t f) {
     static long every = -2; static _Atomic int busy;
     if (every == -2) { const char *e = getenv("DM_GPU_PROBE"); every = e ? atol(e) : 0; if (every > 0) MLOG("DM_GPU_PROBE: two fixed GPU workloads are timed every %ld frames", every); }
-    if (every <= 0 || f % (uint64_t)every || atomic_exchange(&busy, 1)) return;
+    long ev = g_probe_keep_every && (every <= 0 || g_probe_keep_every < every) ? g_probe_keep_every : every; int say = every > 0 && !(f % (uint64_t)every);   // the keeper probes more often than the log wants lines
+    if (ev <= 0 || f % (uint64_t)ev || atomic_exchange(&busy, 1)) return;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ @autoreleasepool {
         static id<MTLTexture> big, small;
         id<MTLRenderPipelineState> ps = gpu_probe_ps();
@@ -2438,9 +2450,10 @@ static void gpu_probe_frame(uint64_t f) {
         id<MTLCommandBuffer> b = [g_q commandBuffer]; rp.colorAttachments[0].texture = small; rp.colorAttachments[0].loadAction = MTLLoadActionClear;
         for (int i = 0; i < 16; i++) { en = [b renderCommandEncoderWithDescriptor:rp]; [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding]; }
         static double ta, qa;
-        [a addCompletedHandler:^(id<MTLCommandBuffer> c) { ta = (c.GPUEndTime - c.GPUStartTime) * 1e3; qa = (c.GPUStartTime - c.kernelEndTime) * 1e3; }];
+        [a addCompletedHandler:^(id<MTLCommandBuffer> c) { ta = (c.GPUEndTime - c.GPUStartTime) * 1e3; qa = (c.GPUStartTime - c.kernelEndTime) * 1e3;
+            uint32_t us = ta > 0 ? (uint32_t)(ta * 1e3) : 0; if (us) { atomic_store(&g_probe_us[atomic_fetch_add(&g_probe_i, 1) % 3], us); uint32_t m = atomic_load(&g_probe_min_us); if (!m || us < m) atomic_store(&g_probe_min_us, us); } }];
         [b addCompletedHandler:^(id<MTLCommandBuffer> c) {
-            MLOG("[gpuprobe] F%llu shading %.3f ms (queued %.3f), 16 small passes %.3f ms (queued %.3f), thermal %d, fill %s %lu so far, game GPU %.2f ms", (unsigned long long)f, ta, qa, (c.GPUEndTime - c.GPUStartTime) * 1e3, (c.GPUStartTime - c.kernelEndTime) * 1e3,
+            if (say) MLOG("[gpuprobe] F%llu shading %.3f ms (queued %.3f), 16 small passes %.3f ms (queued %.3f), thermal %d, fill %s %lu so far, game GPU %.2f ms", (unsigned long long)f, ta, qa, (c.GPUEndTime - c.GPUStartTime) * 1e3, (c.GPUStartTime - c.kernelEndTime) * 1e3,
                  (int)NSProcessInfo.processInfo.thermalState, atomic_load(&g_fill_want) ? "on" : "off", atomic_load(&g_fill_n), f > 8 ? mtl_gpu_ms(f - 8) : -1.0);
             atomic_store(&busy, 0); }];
         [a commit]; [b commit];
