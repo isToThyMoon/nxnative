@@ -7484,7 +7484,7 @@ static unsigned vs_streams(const nvn_refl *rf) {   // the streams the vertex sha
 // there, so the caller skips the draw, as for an index buffer in no pool; a stream with address 0 reads the zero buffer through the vertex descriptor (ZERO_ATTR)
 enum { FA_K_UNI_FWD = 0 }; static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MTLBuffer> *use); static int g_fa_kind;
 #ifndef FA_COPY_MAX_FWD
-#define FA_COPY_MAX_FWD (512u << 10)
+#define FA_COPY_MAX_FWD (16u << 10)
 #endif
 static int bind_vbufs(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf) {
     static struct { uint64_t addr, gpu, gen; } cache[16];
@@ -11364,24 +11364,29 @@ static void fa_bind(uint64_t lo, uint64_t hi) {
 }
 // The GPU address a uniform block of [addr, addr + ul) is read at: in place (gpu) when none of its pages is volatile, else a copy made now in the submission's arena
 static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MTLBuffer> *use) {
-    static struct { uint64_t addr, ul, ep, ver, gpu; void *buf; } ded[FA_DED];
+    static struct { uint64_t addr, ul, ep, ver, fence, gpu; void *buf; } ded[FA_DED];   // gpu 0: read in place (remembered for the commit)
     if (!ul) return gpu;
     int vol = 0;
     for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && atomic_load_explicit(&e->vol, memory_order_relaxed)) { vol = 1; break; } }
+    if (!vol) { fa_bind(addr, addr + ul); return gpu; }
+    // A copy is in the arena of the commit being built, which is released when that commit completes: one made for an earlier commit of the same submission is not used again
+    // (a segment boundary commits; the next segment's draws would read an arena already recycled)
+    uint64_t fn = atomic_load_explicit(&g_fence, memory_order_relaxed);
+    unsigned k = (unsigned)(((addr * 0x9E3779B97F4A7C15ull) ^ (ul * 0xC2B2AE3D27D4EB4Full)) >> 52) & (FA_DED - 1);
+    if (ded[k].addr == addr && ded[k].ul == ul && ded[k].ep == g_fa_epoch && ded[k].ver == g_ubd_ver && ded[k].fence == fn) { if (!ded[k].gpu) return gpu; *use = (__bridge id<MTLBuffer>)ded[k].buf; return ded[k].gpu; }
+    ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = g_fa_epoch; ded[k].ver = g_ubd_ver; ded[k].fence = fn; ded[k].gpu = 0; ded[k].buf = NULL;
     // The copy is the memory as the CPU sees it now. What the GPU still has to write there (an inline update landing by a blit, a storage buffer write, a readback: the last
     // frame's, now that its end is not waited for) is not in it yet: such a block is read in place, in the GPU's order, as before
     if (!vol || g_sbw_over || sbw_hits(addr, addr + ul) || gw_live(addr, addr + ul) || hw_live(addr, addr + ul) || !nvn_host_readable(addr, ul)) { int k0 = g_fa_kind; if (vol) { g_fa_inplace_vol++; g_fa_kind = FA_K_GPUW; } fa_bind(addr, addr + ul); g_fa_kind = k0; return gpu; }
-    unsigned k = (unsigned)(((addr * 0x9E3779B97F4A7C15ull) ^ (ul * 0xC2B2AE3D27D4EB4Full)) >> 52) & (FA_DED - 1);
-    if (ded[k].addr == addr && ded[k].ul == ul && ded[k].ep == g_fa_epoch && ded[k].ver == g_ubd_ver) { *use = (__bridge id<MTLBuffer>)ded[k].buf; return ded[k].gpu; }
     id<MTLBuffer> ab; size_t o = arena_alloc((size_t)ul, &ab);
     memcpy((uint8_t *)ab.contents + o, (const void *)(uintptr_t)addr, (size_t)ul);
     g_fa_snap_n++; g_fa_snap_bytes += ul;
-    ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = g_fa_epoch; ded[k].ver = g_ubd_ver; ded[k].gpu = ab.gpuAddress + o; ded[k].buf = (__bridge void *)ab;
+    ded[k].gpu = ab.gpuAddress + o; ded[k].buf = (__bridge void *)ab;
     *use = ab; return ab.gpuAddress + o;
 }
 // A draw's vertex, index and indirect buffers are read in place (its shaders' buffers are placed where their arguments are encoded: cbuf_slot, encode_args_)
 static void fa_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
-    g_fa_kind = FA_K_VTX; for (int s_ = 0; s_ < 16; s_++) if (S.vbuf[s_].address && (S.vbuf[s_].size > FA_COPY_MAX || !S.vbuf[s_].size)) fa_bind(S.vbuf[s_].address, S.vbuf[s_].address + (S.vbuf[s_].size ? S.vbuf[s_].size : 1));   // smaller ones: bind_vbufs
+    g_fa_kind = FA_K_VTX; for (int s_ = 0; s_ < 16; s_++) if (S.vbuf[s_].address && (S.vbuf[s_].size > (16u << 10) || !S.vbuf[s_].size)) fa_bind(S.vbuf[s_].address, S.vbuf[s_].address + (S.vbuf[s_].size ? S.vbuf[s_].size : 1));   // smaller ones: bind_vbufs
     g_fa_kind = FA_K_IDX; if (di && di->ibuf && (di->ind || (uint64_t)di->count * 4 > FA_COPY_MAX)) fa_bind(di->ibuf, di->ibuf + (uint64_t)di->count * 4);
     uint64_t ind = dw ? dw->ind : di ? di->ind : 0; if (ind) fa_bind(ind, ind + 32);
     g_fa_kind = FA_K_UNI;
