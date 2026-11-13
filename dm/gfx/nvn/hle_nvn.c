@@ -2383,9 +2383,12 @@ static void fstep_tick(const win_t *o, int c) {
     // 18.9 ms frames at hold 1 missed one refresh in 7, never three in a row, and ran at a jittering 53 fps with a payback every few frames instead of a steady 30
     if (mtl_snap_on() && mtl_link_active() && !mtl_link_stalled() && o->presents > 9) {   // (frames the stall fallback drops say nothing about the game: judged by cost then)
         uint64_t pn = o->presents - 8; double a = mtl_presented_time(pn), b = mtl_presented_time(pn - 1);
-        if (a < 0) g_fs.screen = 2; else if (a > 0 && b > 0) g_fs.screen = (a - b) * 1e3 > 1.25 * pres_expect_ms(pn) ? 2 : 1;
-        static uint16_t slow_bits; static int slow_k; int k = g_fs.k ? g_fs.k : kmin;
-        if (k != slow_k) { slow_k = k; slow_bits = 0; }   // judged against the hold in force, not the frames before a step
+        static uint16_t slow_bits; static int slow_k; static uint64_t k_pn; int k = g_fs.k ? g_fs.k : kmin;
+        if (k != slow_k) { slow_k = k; slow_bits = 0; k_pn = o->presents; }   // judged against the hold in force, not the frames before a step
+        // The screen's verdict is 8 presents old: right after a step it is about frames of the hold before, so it says nothing about this one. Breath of the Wild on an iPad (M2):
+        // a probe at hold 1 failed, the step back to 2 then took the failed hold-1 frames for three late frames at 2 and stepped on to 3 three presents later, 877 of 1,800 frames at 20 fps
+        if (pn <= k_pn + 1) g_fs.screen = 1;
+        else if (a < 0) g_fs.screen = 2; else if (a > 0 && b > 0) g_fs.screen = (a - b) * 1e3 > 1.25 * pres_expect_ms(pn) ? 2 : 1;
         slow_bits = (uint16_t)(slow_bits << 1 | (shown > k + FSTEP_LATE));
         if (__builtin_popcount(slow_bits) >= 12) g_fs.screen = 2;
     }
