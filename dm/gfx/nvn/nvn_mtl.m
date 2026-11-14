@@ -5136,6 +5136,7 @@ static struct { unsigned ok; uint32_t sref; MTLViewport vp; MTLScissorRect sc; i
 enum { ED_SREF = 1, ED_VP = 2, ED_SC = 4, ED_CULL = 8, ED_WIND = 16, ED_FILL = 32, ED_BIAS = 64, ED_CLIP = 128, ED_BLEND = 256 };
 static int g_enc_vis, g_enc_has_vis;   // This encoder's current visibility count mode (0 off / slot number + 1), and whether a visibility buffer is attached
 static int g_pso_dirty = 1, g_dss_dirty = 1;   // Pipeline / depth-stencil related state was changed during replay
+static uint64_t g_stat_args_memo;   // uniform slots a patched block kept without resolving them again
 static uint64_t g_stat_args_enc, g_stat_args_reuse, g_stat_args_patch;   // Argument buffer: new-encode / reuse / patched (only CBUF slots written again) counts
 static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;   // Bandwidth ledger: attachment load / store bytes, number of full load-store passes
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
@@ -6189,6 +6190,7 @@ static void shmap_read(void) {
     int gs_loc, lay_loc; char gs_comp, lay_comp;   // a slice-writing geometry shader (no function: the layer comes from input gs_loc.gs_comp) / a vertex shader with layer entry points writing output lay_loc.lay_comp (dmsh_build.py gs_slice, vs_layer_entry); -1 = none
     uint64_t cbs_seen; uint32_t cbs_runs;   // the command buffer that listed this shader last, and how many have (cbs_note)
     // The argument buffer encoded last time
+    uint64_t am_fence, am_ep, am_ubdv, am_pool; int am_npend; uint32_t am_pgen, am_sz[14]; uint8_t am_ok; struct { uint64_t addr, size; } am_ub[16];   // the patch path's memo (encode_args_): what each uniform slot of ab_buf was resolved for
     uint8_t ab_cbuf_only;   // 0 not decided, 1: its only bindings read through a uniform buffer are plain CBUF slots (args_cbuf_only), so a block can be patched when only those changed; 2 not
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass; uint32_t ab_binst; uint64_t ab_pgen;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten); ab_pgen: g_psnap_gen when it was encoded (pools, pool_gpu)
     id<MTLLibrary> bflib; int bflib_state; NSMutableArray *bffn;   // bflib: the readable-tile version <key>_bf (state as afn_state), bffn: its functions specialized by their numbers (NvBfFn, bf_fn)
@@ -11622,9 +11624,24 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
         id<MTLBuffer> ab; size_t off = arena_alloc(arg_len, &ab);
         uint64_t *p = (uint64_t *)(void *)(g_cur_arena->cpu + off);
         memcpy(p, (const uint8_t *)sh->ab_buf.contents + sh->ab_off, arg_len);
+        // A slot whose binding is the one its pointer in the copied block was resolved for keeps that pointer, while nothing else the answer depends on has moved: the
+        // commit (its arena holds the copies), the replayed list, the pools, the inline updates deferred in the pass (g_ubd_ver) and the writes queued (g_npend). Breath of
+        // the Wild patches about 8,000 blocks a frame for one changed slot each and resolved all of them again, 29,000 lookups a frame (DM_NVN_ARGS_MEMO=0 does that)
+        static int memo_on = -1; if (memo_on < 0) { const char *e = getenv("DM_NVN_ARGS_MEMO"); memo_on = !(e && !strcmp(e, "0")); }
+        uint64_t m_fence = atomic_load_explicit(&g_fence, memory_order_relaxed), m_pool = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
+        int same = memo_on && sh->am_ok && sh->am_fence == m_fence && sh->am_ep == g_fa_epoch && sh->am_ubdv == g_ubd_ver && sh->am_pool == m_pool && sh->am_npend == g_npend && sh->am_pgen == g_pend_gen;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; id<MTLBuffer> use;
-            if (b->kind == NVN_RB_CBUF) p[b->aid] = cbuf_slot(sh, nvn_stage, b, &use);
-            else if (b->kind == NVN_RB_CBSIZE) p[b->aid] = cbsize_table(nvn_stage, &use); }
+            if (b->kind == NVN_RB_CBUF) {
+                if (b->reg < 16) { const p_bind_buf *u = &S.ubo[nvn_stage][b->reg];
+                    if (same && sh->am_ub[b->reg].addr == u->addr && sh->am_ub[b->reg].size == u->size) { g_stat_args_memo++; continue; }
+                    sh->am_ub[b->reg].addr = u->addr; sh->am_ub[b->reg].size = u->size; }
+                p[b->aid] = cbuf_slot(sh, nvn_stage, b, &use); }
+            else if (b->kind == NVN_RB_CBSIZE) {
+                uint32_t sz[DMSH_CBSIZE_SLOTS]; for (int r = 0; r < DMSH_CBSIZE_SLOTS; r++) { const p_bind_buf *u = &S.ubo[nvn_stage][r]; sz[r] = u->addr ? u->size < 65536 ? (uint32_t)ub_bound(u->size) : 65536 : 0; }
+                if (same && !memcmp(sz, sh->am_sz, sizeof sz)) { g_stat_args_memo++; continue; }
+                memcpy(sh->am_sz, sz, sizeof sz);
+                p[b->aid] = cbsize_table(nvn_stage, &use); } }
+        sh->am_fence = m_fence; sh->am_ep = g_fa_epoch; sh->am_ubdv = g_ubd_ver; sh->am_pool = m_pool; sh->am_npend = g_npend; sh->am_pgen = g_pend_gen; sh->am_ok = 1;
         bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
         sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; g_args_ubo[nvn_stage] = 0;   // pass, base instance and pool generation are the ones the copied block was encoded for
         g_stat_args_patch++;
@@ -11921,6 +11938,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
     memcpy(g_cur_arena->cpu + off, slots, arg_len);
     if (gmem_aid >= 0) gmem_slot_note((uint64_t *)(void *)(g_cur_arena->cpu + off) + gmem_aid, gml_taken ? (__bridge void *)g_gml_last : NULL);   // the arena arena_alloc took it from (no contents message: see ubo_read)
     bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
+    sh->am_ok = 0;   // the patch path's memo describes the block it copies
     sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_binst = g_draw_binst; sh->ab_pgen = g_psnap_gen; g_args_dirty[nvn_stage] = 0; g_args_ubo[nvn_stage] = 0;
     g_stat_args_enc++;
     return 1;
