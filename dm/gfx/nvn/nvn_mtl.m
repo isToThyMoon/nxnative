@@ -11345,6 +11345,7 @@ static uint64_t ub_padded(NvShader *sh, int st, int reg, const p_bind_buf *u, ui
 typedef struct { _Atomic uint64_t page, fence; _Atomic uint32_t frame; _Atomic uint8_t vol, prot, kind; } fa_pg;   // kind: what read it in place last (FA_K_*)
 enum { FA_K_UNI, FA_K_VTX, FA_K_IDX, FA_K_PTR, FA_K_GPUW, FA_K_N };
 static int g_fa_kind;   // the kind of the binding being placed (the submit thread)
+static int g_fa_force;   // set around a call: copy the block whether its pages are volatile or not (a compute stage's inputs)
 static _Atomic uint64_t g_fa_gate_k[FA_K_N], g_fa_gate_kns[FA_K_N];
 enum { FA_PG = 1 << 18, FA_DED = 4096, FA_COPY_MAX = 512 << 10 };   // FA_COPY_MAX: the largest vertex or index range copied when volatile
 static fa_pg g_fa[FA_PG];
@@ -11433,29 +11434,36 @@ static void fa_bind(uint64_t lo, uint64_t hi) {
 }
 // The GPU address a uniform block of [addr, addr + ul) is read at: in place (gpu) when none of its pages is volatile, else a copy made now in the submission's arena
 static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MTLBuffer> *use) {
-    static struct { uint64_t addr, ul, ep, ver, fence, gpu; void *buf; int npend; uint32_t pgen; } ded[FA_DED];   // gpu 0: read in place (remembered for the commit)
+    // The answers of this commit, by range: a draw asks for every block it binds (about 29,000 times a frame) and most ask for a block an earlier draw of the commit took.
+    // An answer holds for the replayed submission (the game may write between two) and the commit (a copy lives in its arena, released when it completes: one made
+    // for an earlier commit would be read from an arena already recycled), and until a write queued since meets the range (pend_since: an inline update elsewhere, of
+    // which the game sends hundreds a frame, leaves it standing; keyed by the count of queued writes alone, each update made every later bind copy its block again)
+    enum { CN = 16384 };   // a frame binds about 6,000 distinct ranges: with 4,096 slots they pushed each other out and each bind looked its pages up again
+    static struct { uint64_t addr, ul, ep, fence, gpu; void *buf; int npend; uint32_t pgen; uint8_t state; } ded[CN];   // state: 1 read in place, 2 copy at gpu
     if (!ul) return gpu;
+    uint64_t fn = atomic_load_explicit(&g_fence, memory_order_relaxed);
+    unsigned k = (unsigned)(((addr * 0x9E3779B97F4A7C15ull) ^ (ul * 0xC2B2AE3D27D4EB4Full)) >> 50) & (CN - 1);
+    if (ded[k].state && ded[k].addr == addr && ded[k].ul == ul && ded[k].ep == g_fa_epoch && ded[k].fence == fn && ded[k].pgen == g_pend_gen) {
+        if (ded[k].npend != g_npend) { int n = ded[k].npend <= g_npend ? pend_since(addr, addr + ul, ded[k].npend, g_ubp_idx) : -1; if (n == 0) ded[k].npend = g_npend; else ded[k].state = 0; }
+        if (ded[k].state == 1) return gpu;
+        if (ded[k].state == 2) { *use = (__bridge id<MTLBuffer>)ded[k].buf; return ded[k].gpu; } }
+    ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = g_fa_epoch; ded[k].fence = fn; ded[k].npend = g_npend; ded[k].pgen = g_pend_gen; ded[k].state = 1; ded[k].gpu = 0; ded[k].buf = NULL;
     int vol = 0;
     for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && atomic_load_explicit(&e->vol, memory_order_relaxed)) { vol = 1; break; } }
-    if (!vol) { fa_bind(addr, addr + ul); return gpu; }
-    // A copy is in the arena of the commit being built, which is released when that commit completes: one made for an earlier commit of the same submission is not used again
-    // (a segment boundary commits; the next segment's draws would read an arena already recycled)
-    uint64_t fn = atomic_load_explicit(&g_fence, memory_order_relaxed);
-    unsigned k = (unsigned)(((addr * 0x9E3779B97F4A7C15ull) ^ (ul * 0xC2B2AE3D27D4EB4Full)) >> 52) & (FA_DED - 1);
-    if (ded[k].addr == addr && ded[k].ul == ul && ded[k].ep == g_fa_epoch && ded[k].ver == g_ubd_ver && ded[k].fence == fn && ded[k].npend == g_npend && ded[k].pgen == g_pend_gen) { if (!ded[k].gpu) return gpu; *use = (__bridge id<MTLBuffer>)ded[k].buf; return ded[k].gpu; }
-    ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = g_fa_epoch; ded[k].ver = g_ubd_ver; ded[k].fence = fn; ded[k].gpu = 0; ded[k].buf = NULL; ded[k].npend = g_npend; ded[k].pgen = g_pend_gen;
+    if (!vol && !g_fa_force) { fa_bind(addr, addr + ul); return gpu; }
     // The block as the GPU will read it at this point: memory, with the inline updates of submissions still running and of this one laid over it (ubp_get: the host has
     // their bytes, the game's memory gets them only when their blit has run). So a block the game updates inline every frame is copied too, and its page needs no
     // protection; ubp_get refuses what the CPU cannot know (a copy, a fill or a shader's store still to come)
-    { uint64_t g; const uint8_t *c; g_ubp_sync = 1; int got = ul <= UBP_MAX_BYTES && ubp_get(addr, addr + ul, &g, &c); g_ubp_sync = 0; if (got) { g_fa_snap_n++; g_fa_snap_bytes += ul; ded[k].gpu = g; ded[k].buf = (__bridge void *)*use; return g; } }
-    // The copy is the memory as the CPU sees it now. What the GPU still has to write there (an inline update landing by a blit, a storage buffer write, a readback: the last
-    // frame's, now that its end is not waited for) is not in it yet: such a block is read in place, in the GPU's order, as before
-    if (!vol || g_sbw_over || sbw_hits(addr, addr + ul) || gw_live(addr, addr + ul) || hw_live(addr, addr + ul) || !nvn_host_readable(addr, ul)) { int k0 = g_fa_kind; if (vol) { g_fa_inplace_vol++; g_fa_kind = FA_K_GPUW; } fa_bind(addr, addr + ul); g_fa_kind = k0; return gpu; }
+    { uint64_t g; const uint8_t *c; g_ubp_sync = 1; int got = ul <= UBP_MAX_BYTES && ubp_get(addr, addr + ul, &g, &c); g_ubp_sync = 0;
+      if (got) { g_fa_snap_n++; g_fa_snap_bytes += ul; ded[k].gpu = g; ded[k].buf = (__bridge void *)*use; ded[k].state = 2; return g; } }
+    // The copy is the memory as the CPU sees it now. What the GPU still has to write there (a storage buffer write, a readback: the last frame's, now that its end is
+    // not waited for) is not in it yet: such a block is read in place, in the GPU's order, as before
+    if (g_sbw_over || sbw_hits(addr, addr + ul) || gw_live(addr, addr + ul) || hw_live(addr, addr + ul) || !nvn_host_readable(addr, ul)) { int k0 = g_fa_kind; g_fa_inplace_vol++; g_fa_kind = FA_K_GPUW; fa_bind(addr, addr + ul); g_fa_kind = k0; return gpu; }
     id<MTLBuffer> ab; size_t o = arena_alloc((size_t)ul, &ab);
-    memcpy((uint8_t *)ab.contents + o, (const void *)(uintptr_t)addr, (size_t)ul);
+    memcpy(g_cur_arena->cpu + o, (const void *)(uintptr_t)addr, (size_t)ul);
     g_fa_snap_n++; g_fa_snap_bytes += ul;
-    ded[k].gpu = ab.gpuAddress + o; ded[k].buf = (__bridge void *)ab;
-    *use = ab; return ab.gpuAddress + o;
+    ded[k].gpu = g_cur_arena->gpu + o; ded[k].buf = (__bridge void *)ab; ded[k].state = 2;
+    *use = ab; return ded[k].gpu;
 }
 // A draw's vertex, index and indirect buffers are read in place (its shaders' buffers are placed where their arguments are encoded: cbuf_slot, encode_args_)
 static void fa_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
@@ -11775,7 +11783,11 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             void *mb; uint64_t mo, gpu;
             if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); if (b->rw && b->kind == NVN_RB_SBUFP && !(reg < 32 && (sh->sb_ro >> reg & 1))) sbw_note(u->addr, sbw_len(u->size, mb, mo), SBW_GPU);   // cb_extent.tsv: slots the shader never writes
                 if (fa_on()) {   // frame ahead: a block the shader only reads is copied when its pages are volatile (as a uniform block, fa_cbuf), anything else is read in place
-                    g_fa_kind = FA_K_PTR; if (!b->rw && u->size && u->size <= (256u << 10)) { __strong id<MTLBuffer> fb = (__bridge id<MTLBuffer>)mb; uint64_t g2 = fa_cbuf(u->addr, u->size, gpu, &fb); if (g2 != gpu) { slots[aid] = g2; USE(fb, MTLResourceUsageRead); } }
+                    // A compute stage's read-only blocks are always copied, volatile page or not: a kernel that stores through what it reads (Breath of the Wild's effect
+                    // kernels: five pointer uniforms, four read-only storage buffers) and is given the next frame's half-written inputs stores out of bounds, which the
+                    // GPU reports as a hang (iPhone) or a page fault (Mac): 4-5 in 12 minutes with frame ahead. A page counts as volatile only after its first write was
+                    // seen, and under the learning gate that first write is not held back. Savage Wind Recomp met the same fault and copies every constant buffer
+                    g_fa_kind = FA_K_PTR; if (!b->rw && u->size && u->size <= (256u << 10)) { __strong id<MTLBuffer> fb = (__bridge id<MTLBuffer>)mb; g_fa_force = nvn_stage == 5; uint64_t g2 = fa_cbuf(u->addr, u->size, gpu, &fb); g_fa_force = 0; if (g2 != gpu) { slots[aid] = g2; USE(fb, MTLResourceUsageRead); } }
                     else { fa_bind(u->addr, u->addr + (u->size ? u->size : 1)); fa_ptr_note(nvn_stage, reg, b->rw, b->kind == NVN_RB_UBOP, u->addr, u->size); }
                     g_fa_kind = FA_K_UNI; } }
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
