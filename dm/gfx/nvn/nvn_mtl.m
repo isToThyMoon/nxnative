@@ -2389,7 +2389,7 @@ static _Atomic int g_fill_want; static _Atomic unsigned long g_fill_n;
 static _Atomic int g_fill_shape;   // 0: one pass of six draws on 256 x 256 (a block of shading); 1: sixteen one-triangle passes on 64 x 64 (the same thread, work cut into passes: DM_GPU_SHAPE_TEST)
 static _Atomic int g_fill_share = 1000;   // the share of the time the fill runs while wanted, in thousandths (the keeper sets it; 1000 = without pause, two buffers in flight)
 static void *gpu_fill_thread(void *arg) {
-    (void)arg; pthread_setname_np("dm-gpu-fill"); pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);   // utility: its commits need no fast core
+    (void)arg; pthread_setname_np("dm-gpu-fill"); pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);   // as in the run that held best
     id<MTLRenderPipelineState> ps = gpu_probe_ps(); id<MTLTexture> t[2] = {gpu_probe_tex(128), gpu_probe_tex(128)}, sm[2] = {gpu_probe_tex(64), gpu_probe_tex(64)}; if (!ps || !t[0] || !t[1] || !sm[0] || !sm[1]) return NULL;
     dispatch_semaphore_t sem = dispatch_semaphore_create(2);
     for (unsigned k = 0;; k++) { @autoreleasepool {
@@ -2448,27 +2448,21 @@ static void gpu_fill_frame(uint64_t f) {
                      f == 330 ? "after 90 frames of the block fill" : f == 689 ? "after a rest of 6 s" : f == 870 ? "after 180 frames of the small-pass fill" : f == 1229 ? "after a second rest of 6 s" : "after 180 frames of the block fill",
                      r, est / 1e3, base / 1e3, nn - n0, ema); n0 = nn; }
             if (f > 330) { atomic_store(&g_fill_want, frag || blk); if (!started) { started = 1; pthread_t th; pthread_create(&th, NULL, gpu_fill_thread, NULL); pthread_detach(th); } return; } }
-        // The level the scene needs: the game's GPU time is its work at full clock (W, learned from frames with little fill: the fill adds to the game's GPU time) times
-        // the level, and the serial frame leaves it about 11.5 ms, so the level to hold is 10 ms / W (a menu's W of 1 ms needs none; a scene of 8 ms needs 1.25).
-        // The fill runs a share of the time, moved by the level's error at each probe: bursts that fill every frame made the system lower the CPU clock once they
-        // covered two thirds of the frames (4.0 -> 1.4 GHz at 85%: the game was then late on the CPU, as a game the system takes to be GPU-bound), and bursts capped at
-        // 40% of the frames let the clock fall between them (level 2.8-3.2 where 1.45 was wanted). A steady share finds the least fill that holds the level
-        static double W, share, share_sum; static uint32_t probe_seen; static uint64_t share_n; (void)hi; (void)lo; (void)run;
-        { uint32_t pmx = p0 > p1 ? p0 : p1; if (p2 > pmx) pmx = p2;
-          if (!calib && r > 0 && share < 0.25 && est && p0 && p1 && p2 && pmx * 100 <= est * 115) { double g = mtl_gpu_ms(seen); if (g > 0) { double w = g / r; W = W > 0 ? W + 0.1 * (w - W) : w; } } }
-        double want = W > 0 ? 10.0 / W : 99; if (want < 1.0) want = 1.0;
-        uint32_t pi = atomic_load(&g_probe_i);
-        if (pi != probe_seen && r > 0 && !calib) { probe_seen = pi;   // a new probe: move the share
-            if (W <= 0 || want > 4.5) share = 0;                               // a light scene: the floor is enough
-            else if (r > want * 1.5) share += 0.20;                            // far too slow: a late frame is near
-            else if (r > want * 1.05) share += 0.06;
-            else if (r < want * 0.85) share -= 0.06;
-            else if (r < want * 0.97) share -= 0.02;
-            if (share < 0) share = 0; if (share > 0.6) share = 0.6;            // never the whole time: see above
-            if (share > 0 && !state) kicks++; state = share > 0; }
-        if (state) filled++;
-        share_sum += share; share_n++;
-        atomic_store(&g_fill_share, calib ? 1000 : (int)(share * 1000));
+        // The rule of the run that held 60 fps best (runs/20261113-keep-probe: 15,000 frames, level 1.2-1.8, the fill on 55% of the frames): the fill starts above
+        // level <high> or 10.5 ms of GPU time, never at full clock or in a light scene, runs 20 frames at least and stops below level <low> with the GPU time under
+        // 9 ms. Three other rules were tried on the phone and were worse: stopping by the level alone with a larger fill buffer (the game's passes waited behind
+        // the fill, the fill ran 84-88% of the frames and the system lowered the CPU clock to 1.4 GHz: 45-50 fps), bursts capped at 40% of the frames (the clock fell
+        // between them, level 2.8-3.2: 41-48 fps), and a steady share of the time with one buffer in flight (the controller does not raise the clock for it at all:
+        // level 4.77 at a share of 60%, 32-35 fps). The controller answers only a GPU kept full without a gap, and the system lowers the CPU clock when that lasts
+        // for more than about two thirds of the frames, so this rule sits between the two and is not robust
+        double want = 0, W = 0, share = state ? 1 : 0; static double share_sum; static uint64_t share_n;
+        if (!state) { if (!calib && r > 0 && r >= 1.2 && ema > 7.0 && (r > hi || ema > 10.5)) { state = 1; run = 0; kicks++; } }
+        else { filled++; run++;
+            if (run >= 20) { if (r > 0 && r < 1.2) { state = 0; if (ema > 10.5) atmax_stops++; }
+                             else if (r > 0 && r < lo && ema < 9.0) state = 0;
+                             else if (ema <= 7.0) state = 0; } }
+        share_sum += state ? 1 : 0; share_n++;
+        atomic_store(&g_fill_share, 1000);
         if (f && !(f % 600)) MLOG("[gpukeep] up to frame %llu: clock level %.2f, wanted %.2f for %.2f ms of work at full clock (probe %.3f ms, full clock %.3f ms), game GPU running mean %.2f ms; fill share now %.0f%%, mean %.0f%% over the last 600 frames; %llu fills started, %llu frames with a fill in all, thermal %d",
                                   (unsigned long long)f, r, want > 98 ? 0.0 : want, W, est / 1e3, base / 1e3, ema, share * 100, share_n ? share_sum / share_n * 100 : 0.0, (unsigned long long)kicks, (unsigned long long)filled, (int)NSProcessInfo.processInfo.thermalState); if (f && !(f % 600)) { share_sum = 0; share_n = 0; } (void)atmax_stops;
         atomic_store(&g_fill_want, state || calib || (mode && sw_on(mode)));
