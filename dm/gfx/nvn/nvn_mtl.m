@@ -2429,10 +2429,10 @@ static void *gpu_fill_thread(void *arg) {
 static _Atomic uint32_t g_probe_us[3]; static _Atomic uint32_t g_probe_i, g_probe_min_us;   // the last three probe shading times and the shortest ever (microseconds)
 static long g_probe_keep_every;   // the keeper's probe period (0 = off)
 static void gpu_fill_frame(uint64_t f) {
-    static int mode = -1, keep, started, state, run; static double hi = 2.3, lo = 2.0, ema; static uint64_t kicks, filled, seen, atmax_stops, calib_until;
+    static int mode = -1, keep, started, state, run, ms_mode; static double hi = 2.3, lo = 2.0, ema, on_ms, off_ms; static uint64_t kicks, filled, seen, atmax_stops, calib_until;
     if (mode < 0) { mode = sw_mode("DM_GPU_FILL", 0); if (mode) MLOG("DM_GPU_FILL: the GPU is kept busy between the game's submissions (experiment)");
         const char *e = getenv("DM_GPU_KEEP"); keep = e && atof(e) > 0;
-        if (keep) { double a = 0, b = 0; int n = sscanf(e, "%lf,%lf", &a, &b); if (n >= 2 && a > 1.2 && b > 1.0 && b < a) { hi = a; lo = b; }
+        if (keep) { double a = 0, b = 0; int n = sscanf(e, "%lf,%lf", &a, &b); if (n >= 2 && a > 4 && b > 4 && b < a) { ms_mode = 1; on_ms = a; off_ms = b; } else if (n >= 2 && a > 1.2 && b > 1.0 && b < a) { hi = a; lo = b; }
             g_probe_keep_every = 10;
             MLOG("DM_GPU_KEEP: the fill holds the GPU clock: it starts above level %.2f of the probe's full-clock time or 12 ms of GPU time and runs until level %.2f", hi, lo); } }
     if (!mode && !keep) return;
@@ -2462,7 +2462,14 @@ static void gpu_fill_frame(uint64_t f) {
         // level 4.77 at a share of 60%, 32-35 fps). The controller answers only a GPU kept full without a gap, and the system lowers the CPU clock when that lasts
         // for more than about two thirds of the frames, so this rule sits between the two and is not robust
         double want = 0, W = 0, share = state ? 1 : 0; static double share_sum; static uint64_t share_n;
-        if (!state) { if (!calib && r > 0 && r >= 1.2 && ema > 7.0 && (r > hi || ema > 10.5)) { state = 1; run = 0; kicks++; } }
+        // With frame ahead (DM_GPU_KEEP=<on ms>,<off ms>, both above 4): the game keeps the GPU supplied and the controller holds the clock by itself, at about 87%
+        // of the frame (GPU p50 14.5 ms, p95 19 ms: one frame in ten misses its tick). The fill only moves that balance a level up: it starts when the GPU's running
+        // mean passes <on ms> and stops below <off ms> or at full clock, 12 to 60 frames a burst, each followed by a rest as long (half the frames at most)
+        static uint64_t rest_until;
+        if (ms_mode) {
+            if (!state) { if (!calib && r > 0 && r >= 1.15 && ema > on_ms && f >= rest_until) { state = 1; run = 0; kicks++; } }
+            else { filled++; run++; if (run >= 60 || (run >= 12 && ((r > 0 && r < 1.15) || ema < off_ms))) { state = 0; rest_until = f + (uint64_t)run; } } }
+        else if (!state) { if (!calib && r > 0 && r >= 1.2 && ema > 7.0 && (r > hi || ema > 10.5)) { state = 1; run = 0; kicks++; } }
         else { filled++; run++;
             if (run >= 20) { if (r > 0 && r < 1.2) { state = 0; if (ema > 10.5) atmax_stops++; }
                              else if (r > 0 && r < lo && ema < 9.0) state = 0;
