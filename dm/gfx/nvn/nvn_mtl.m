@@ -1706,10 +1706,16 @@ static inline id enc_b_begin(id cb) {
 static inline void enc_b_end(id e) { m4_end(e); }
 static inline void enc_b_copy_buffer(id e, id<MTLBuffer> s, NSUInteger so, id<MTLBuffer> d, NSUInteger doff, NSUInteger n) { [e copyFromBuffer:s sourceOffset:so toBuffer:d destinationOffset:doff size:n]; }
 static inline void enc_b_copy_buffer_texture(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, NSUInteger img, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o) { [e copyFromBuffer:s sourceOffset:so sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o]; }
-static inline void enc_b_copy_texture_buffer(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img]; }
+// Frame ahead: what the game reads on the CPU once its fence is signalled holds that fence's wait (fa_readback): an event word or a counter report.
+// Timestamp reports feed the host's own frame step only, and samples-passed reports (occlusion queries: 3.7 a frame in the open world) arrive a frame late: holding
+// for them made every frame wait in full. Textures read back into memory do not hold it: Breath of the Wild reads 16 texels or fewer back about 3.7
+// times a frame (counted by fa_small_readback), so holding for those made every frame wait in full, and whole render targets stored back into their pools arrive a
+// frame late, as in Savage Wind Recomp (which holds only the first 30 small readbacks after a load)
+static void fa_readback(void); static void fa_small_readback(void);
+static inline void enc_b_copy_texture_buffer(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img) { if (z.width * z.height * z.depth <= 16) fa_small_readback(); [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img]; }
 // The same with a blit option: one plane of a combined depth / stencil texture (MTLBlitOptionDepthFromDepthStencil)
 static inline void enc_b_copy_buffer_texture_opt(id e, id<MTLBuffer> s, NSUInteger so, NSUInteger row, NSUInteger img, MTLSize z, id<MTLTexture> d, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLBlitOption opt) { [e copyFromBuffer:s sourceOffset:so sourceBytesPerRow:row sourceBytesPerImage:img sourceSize:z toTexture:d destinationSlice:sl destinationLevel:lv destinationOrigin:o options:opt]; }
-static inline void enc_b_copy_texture_buffer_opt(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img, MTLBlitOption opt) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img options:opt]; }
+static inline void enc_b_copy_texture_buffer_opt(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin o, MTLSize z, id<MTLBuffer> d, NSUInteger doff, NSUInteger row, NSUInteger img, MTLBlitOption opt) { if (z.width * z.height * z.depth <= 16) fa_small_readback(); [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:o sourceSize:z toBuffer:d destinationOffset:doff destinationBytesPerRow:row destinationBytesPerImage:img options:opt]; }
 static inline void enc_b_copy_texture(id e, id<MTLTexture> s, NSUInteger sl, NSUInteger lv, MTLOrigin so, MTLSize z, id<MTLTexture> d, NSUInteger dl, NSUInteger dv, MTLOrigin doo) { [e copyFromTexture:s sourceSlice:sl sourceLevel:lv sourceOrigin:so sourceSize:z toTexture:d destinationSlice:dl destinationLevel:dv destinationOrigin:doo]; }
 static void blit_note(void);   // Per-pass dump: a copy / buffer update ended the render pass (defined after PD)
 // Ordering inside the copy encoder: Metal 4 does not order copies / fills within one encoder (no automatic hazard tracking); an operation reading or writing a range an earlier one wrote needs an intra-encoder barrier.
@@ -2186,9 +2192,9 @@ static void vis_take(void) {
     if (!g_vis_ring[pick].buf) { g_vis_ring[pick].buf = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis_ring[pick].buf); }
     g_vis = g_vis_ring[pick].buf; g_vis_n = 0;
 }
-void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { post((post_op){1, val, mode, v, 0, 0, NULL}); }
+void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v) { fa_readback(); post((post_op){1, val, mode, v, 0, 0, NULL}); }
 static void ts_clk(void);
-void mtl_sub_counter(uint64_t addr, uint32_t type) { sbw_note(addr, 16, SBW_REPORT); hw_note(addr); post((post_op){2, NULL, 0, 0, addr, type, NULL, g_seg}); ts_clk(); }
+void mtl_sub_counter(uint64_t addr, uint32_t type) { if (type != 0 && type != 0x10) fa_readback(); sbw_note(addr, 16, SBW_REPORT); hw_note(addr); post((post_op){2, NULL, 0, 0, addr, type, NULL, g_seg}); ts_clk(); }
 void mtl_counter_stats(uint64_t rep[32], uint64_t rst[32]) { memcpy(rep, g_cnt_report, sizeof g_cnt_report); memcpy(rst, g_cnt_reset, sizeof g_cnt_reset); }
 
 // Counter timestamps (614.4 MHz) are taken from the guest clock (hle_os.c guest_ns, the same epoch as svc GetSystemTick / cntpct, whose ticks are 19.2 MHz, 31.25 MHz on the Switch 2: guest_ticks).
@@ -11414,6 +11420,10 @@ static void fa_gate(uintptr_t lo, uintptr_t hi) {
     }
 }
 static void fa_block(void) { uint64_t f = atomic_load(&g_fence) + 1; if (atomic_load(&g_fa_block) != f) { atomic_store(&g_fa_block, f); g_fa_blocks++; } }
+static uint64_t g_fa_readbacks;
+static void fa_readback(void) { if (fa_on()) { g_fa_readbacks++; fa_block(); } }
+static uint64_t g_fa_small_rb;
+static void fa_small_readback(void) { if (g_fa_mode > 0) g_fa_small_rb++; }
 // A zero-copy binding of [lo, hi): its pages are read by the submission being replayed, and protected so that a write passes the gate
 static void fa_bind(uint64_t lo, uint64_t hi) {
     static struct { uint64_t lo, hi, f; } ded[FA_DED];
@@ -11494,8 +11504,8 @@ static void fa_frame(uint64_t f) {   // the submit thread, when the frame it rep
     { static double ema; static uint64_t seen; for (uint64_t k = f > 2 ? f - 2 : 0; k > seen && k + 12 > f; k--) { double g = mtl_gpu_ms(k); if (g > 0) { ema = ema > 0 ? ema + 0.1 * (g - ema) : g; seen = k; atomic_store_explicit(&g_fa_gpu_us, (uint32_t)(ema * 1000), memory_order_relaxed); break; } } }
     static uint64_t p[12]; uint64_t v[12] = {g_fa_inplace_vol, atomic_load(&g_fa_ahead_n), atomic_load(&g_fa_real_n), g_fa_snap_n, g_fa_snap_bytes, g_fa_binds, g_fa_prot, atomic_load(&g_fa_gate_n), atomic_load(&g_fa_gate_ns), g_fa_blocks, atomic_load(&g_fa_gate_late), atomic_load(&g_fa_skip)};
     if (f && !(f % 600)) { double n = 600.0;
-        MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB), on volatile pages but read in place for a GPU write still to come %.1f; ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); by what read the page in place: uniform %llu, vertex %llu, index %llu, pointer or storage %llu, a block with a GPU write to come %llu (totals); submissions the wait must cover %.2f; acquires that skipped the display tick %.2f; volatile pages %llu; table full %llu, gate timeouts %llu",
-             (unsigned long long)f, (v[1] - p[1]) / n, (v[2] - p[2]) / n, (v[3] - p[3]) / n, (v[4] - p[4]) / n / 1024.0, (v[0] - p[0]) / n, (v[5] - p[5]) / n, (v[6] - p[6]) / n, (v[7] - p[7]) / n, (v[8] - p[8]) / n / 1e6, (unsigned long long)atomic_load(&g_fa_gate_k[0]), (unsigned long long)atomic_load(&g_fa_gate_k[1]), (unsigned long long)atomic_load(&g_fa_gate_k[2]), (unsigned long long)atomic_load(&g_fa_gate_k[3]), (unsigned long long)atomic_load(&g_fa_gate_k[4]), (v[9] - p[9]) / n, (v[11] - p[11]) / n,
+        MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB), on volatile pages but read in place for a GPU write still to come %.1f; ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); by what read the page in place: uniform %llu, vertex %llu, index %llu, pointer or storage %llu, a block with a GPU write to come %llu (totals); submissions the wait must cover %.2f (reports that hold it so far %llu; samples-passed reports and small texture readbacks, which do not, %llu); acquires that skipped the display tick %.2f; volatile pages %llu; table full %llu, gate timeouts %llu",
+             (unsigned long long)f, (v[1] - p[1]) / n, (v[2] - p[2]) / n, (v[3] - p[3]) / n, (v[4] - p[4]) / n / 1024.0, (v[0] - p[0]) / n, (v[5] - p[5]) / n, (v[6] - p[6]) / n, (v[7] - p[7]) / n, (v[8] - p[8]) / n / 1e6, (unsigned long long)atomic_load(&g_fa_gate_k[0]), (unsigned long long)atomic_load(&g_fa_gate_k[1]), (unsigned long long)atomic_load(&g_fa_gate_k[2]), (unsigned long long)atomic_load(&g_fa_gate_k[3]), (unsigned long long)atomic_load(&g_fa_gate_k[4]), (v[9] - p[9]) / n, (unsigned long long)g_fa_readbacks, (unsigned long long)g_fa_small_rb, (v[11] - p[11]) / n,
              (unsigned long long)atomic_load(&g_fa_vol_n), (unsigned long long)g_fa_full, (unsigned long long)(v[10] - p[10]));
         { static uint64_t w0[6]; uint64_t w[6]; mtl_ubp_why(w);
           MLOG("[ahead] copies refused since the last line (the block is then read in place): too large or shadows off %llu, a shader's store to come %llu, a copy or fill of a running submission %llu, a copy or fill of this submission %llu, unreadable %llu, a report to land %llu; storage writes answered by a wide write %llu (the last %llu bytes wide), by a cell %llu, write set full now %d",
@@ -15995,7 +16005,7 @@ void mtl_exec(const uint8_t *p) {
                     if (!g_vis_on) {   // a report with no reset before it: the counter runs from the queue's creation, so counting starts here (Occlusion queries)
                         g_vis_on = 1; g_vis_counting = 1; MLOG("occlusion queries: samples passed reported with no ResetCounter before it: counting from this report");
                         if (g_enc && !g_enc_has_vis) { PD("M %llu occlusion query counting starts at a report: render pass split here", g_stat_pass); rp_end(); } }
-                    hw_note(ad); post((post_op){3, NULL, VIS_REPORT, 0, ad, (uint32_t)t, vis_snapshot()}); vis_clear(); }   // written at completion, as a counter report
+                    fa_small_readback(); hw_note(ad); post((post_op){3, NULL, VIS_REPORT, 0, ad, (uint32_t)t, vis_snapshot()}); vis_clear(); }   // written at completion, as a counter report
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // recorded only with the profile key render_cond (hle_nvn.c)
