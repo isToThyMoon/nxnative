@@ -14401,6 +14401,8 @@ static int csh_draw_reads(NvProg *pr, const p_draw *dw, const p_draw_idx *di, cs
     return 1;
 }
 // A dispatch at its place in the stream (S as it is there): its storage buffers (counted as written), and whether it samples a colour attachment of the pass (1), only the depth (2)
+static uint64_t g_csh_split_ser, g_csh_split_fence, g_csh_stale;   // the depth attachment and submission of the last split a depth-sampling dispatch made; dispatches run on that depth
+static int csh_depth_split(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_CSH_DEPTH"); v = e && !strcmp(e, "split"); if (v) MLOG("DM_NVN_CSH_DEPTH=split: after a depth-sampling dispatch has split a pass, the later ones of the pass run ahead on the depth of that split"); } return v; }
 static char g_csh_why[96];   // why csh_cs refused the last dispatch (logged once per shader)
 #define CSH_NO(...) do { snprintf(g_csh_why, sizeof g_csh_why, __VA_ARGS__); return 0; } while (0)
 static int csh_cs(NvShader *cs, const p_dispatch *dp, csh_rng *w, int *nw, int *depth) {
@@ -14472,7 +14474,13 @@ static void cs_hoist_try(NvProg *pr0, const p_draw *dw0, const p_draw_idx *di0) 
                 { static char seen[64][20]; static int ns; const char *key = cs ? cs->key : "-"; int k = 0; for (; k < ns; k++) if (!strncmp(seen[k], key, 19)) break;
                   if (k == ns && ns < 64) { strncpy(seen[ns++], key, 19); MLOG("[cshoist] dispatch %s not moved ahead: %s", key, g_csh_why); } }
                 break; }
-            if (depth && dwrote) { g_csh_stop[7]++; break; }   // it would miss depth the draws before it wrote
+            // The depth as it was at the pass's last split (DM_NVN_CSH_DEPTH=split): once a depth-sampling dispatch has split a pass, the later ones of that pass run where
+            // the pass reopens, on the depth stored at that split. They miss what the draws after the split wrote to it (Breath of the Wild: the particles' collision
+            // against the scene; the effect draws between two emitters). Each one left in place stores and loads every attachment of the pass again
+            if (depth && dwrote) {
+                if (!(csh_depth_split() && R.rt.depth && g_csh_split_ser == R.rt.depth->serial && g_csh_split_fence == atomic_load_explicit(&g_fence, memory_order_relaxed))) {
+                    g_csh_stop[7]++; g_csh_split_ser = R.rt.depth ? R.rt.depth->serial : 0; g_csh_split_fence = atomic_load_explicit(&g_fence, memory_order_relaxed); break; }
+                g_csh_stale++; }
             if (csh_hit(wr, nwr, rd, nrd)) { g_csh_stop[3]++; break; }   // the draws before it read what it writes
             if (g_csh_n >= CSH_MAX) { g_csh_stop[4]++; break; }
             PD("H %llu dispatch %s moved ahead of the pass%s", g_stat_pass + 1, cs->key, depth ? " (samples the pass's depth, which no draw before it wrote)" : "");
