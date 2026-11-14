@@ -11353,8 +11353,11 @@ static _Atomic uint64_t g_fa_floor, g_fa_block, g_fa_gate_n, g_fa_gate_ns, g_fa_
 static uint64_t g_fa_inplace_vol, g_fa_snap_n, g_fa_snap_bytes, g_fa_binds, g_fa_prot, g_fa_blocks, g_fa_full;
 static _Atomic uint64_t g_fa_ahead_n, g_fa_real_n;
 static void fa_gate(uintptr_t lo, uintptr_t hi);
+static int g_fa_gate_learn = -1;
+static inline int fa_gate_learn(void) { return g_fa_gate_learn > 0; }
 __attribute__((noinline)) static int fa_mode_init(void) {
     g_fa_mode = sw_mode("DM_FRAME_AHEAD", 0);
+    { const char *e = getenv("DM_FRAME_AHEAD_GATE"); g_fa_gate_learn = e && !strcmp(e, "learn"); if (g_fa_gate_learn) MLOG("DM_FRAME_AHEAD_GATE=learn: a write to a page a frame in flight reads does not wait; the page is copied from then on"); }
     if (g_fa_mode) { nvn_dirty_set_gate(fa_gate); MLOG("DM_FRAME_AHEAD: the game's wait on its newest fence covers the frames before the current one, and bound memory is kept by page (experiment)"); }
     return g_fa_mode;
 }
@@ -11399,6 +11402,10 @@ static void fa_gate(uintptr_t lo, uintptr_t hi) {
         // The submit thread's own writes (an inline update landing) keep their order with the frame being replayed, as before; they wait only for an earlier frame's readers.
         // A fence not committed yet is the frame in replay: nothing to wait for
         if (f > atomic_load(&g_fence) || f <= atomic_load(&g_done) || (sub && atomic_load(&e->frame) == cur)) continue;
+        // DM_FRAME_AHEAD_GATE=learn: the write does not wait. The page is volatile from now on, so what binds it next is copied; the frame in flight may read this one
+        // write early. Savage Wind Recomp's GPU overlap runs the same game this way (no page protection: copies learned from what was seen to change), and the wait
+        // here was 15-17 ms a frame, most of the overlap
+        if (fa_gate_learn()) { atomic_fetch_add(&g_fa_gate_n, 1); atomic_fetch_add(&g_fa_gate_k[atomic_load_explicit(&e->kind, memory_order_relaxed) % FA_K_N], 1); continue; }
         uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int k = 0;
         for (; k < 30000 && atomic_load(&g_done) < f; k++) usleep(100);
         uint64_t dt = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0; unsigned kd = atomic_load_explicit(&e->kind, memory_order_relaxed) % FA_K_N;
