@@ -17303,6 +17303,7 @@ int mtl_snap_on(void) {
     static int v = -1; if (v >= 0) return v;
     const char *e = getenv("DM_PRESENT_SNAP");
     int n = e ? atoi(e) : dm_prof()->present_snap ? 2 : 0;   // the profile's present_snap (a ring of 2)
+    const char *r = getenv("DM_PRESENT_RING"); if (n > 0 && r && atoi(r) > 0) n = atoi(r);   // the ring's length apart from the launcher's on/off choice, which sets DM_PRESENT_SNAP=1 before an env file is read
     v = n > 0; g_snap_n = n < 2 ? 2 : n > SNAP_MAX ? SNAP_MAX : n;
     if (v) MLOG("present snapshots (DM_PRESENT_SNAP=%d): each present is copied into a ring of %d host textures, so the screen never samples the game's texture", n, g_snap_n);
     else MLOG("present snapshots off (%s): the screen shows the game's own texture", e ? "DM_PRESENT_SNAP" : "game profile present_snap");   // Frame buffering off: the log says so too
