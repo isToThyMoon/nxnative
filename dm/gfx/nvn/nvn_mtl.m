@@ -11475,8 +11475,12 @@ static void fa_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
 }
 // The GPU has not finished the frames before the one being replayed: it is the bottleneck, and the acquire does not wait for a display tick (hle_nvn.c), so the next frame's
 // work is committed while this one runs and the GPU is never idle between them. The display link still shows one frame a tick and drops none but the oldest
-static _Atomic uint64_t g_fa_skip;
-int mtl_fa_behind(void) { if (!fa_on() || atomic_load(&g_done) >= atomic_load(&g_fa_floor)) return 0; atomic_fetch_add(&g_fa_skip, 1); return 1; }
+// Only while the GPU's frames take longer than a vsync on average (g_fa_gpu_us, a running mean): a GPU that keeps up is not behind because one frame ran long, and
+// without the tick the game made frames faster than the screen shows them (acquires skipped 0.11-0.13 a frame: game time 1.03-1.06 of real time, 76-330 frames merged
+// away per 300 ticks, 11% of the frames dropped on screen, the picture uneven at "60 fps"). On the tick each frame has two vsyncs to reach its display time, which a
+// frame of 19 ms makes
+static _Atomic uint64_t g_fa_skip; static _Atomic uint32_t g_fa_gpu_us;
+int mtl_fa_behind(void) { if (!fa_on() || atomic_load(&g_done) >= atomic_load(&g_fa_floor) || atomic_load_explicit(&g_fa_gpu_us, memory_order_relaxed) < 16700) return 0; atomic_fetch_add(&g_fa_skip, 1); return 1; }
 // The in-place pointer and storage bindings seen, by stage, slot and size: said once each (what the write gate waits for when the game writes their pages)
 static void fa_ptr_note(int stage, int reg, int rw, int ubop, uint64_t addr, uint64_t size) {
     static struct { int st, reg, rw, ubop; uint64_t size; } seen[48]; static int n;
@@ -11487,6 +11491,7 @@ static void fa_ptr_note(int stage, int reg, int rw, int ubop, uint64_t addr, uin
 }
 static void fa_frame(uint64_t f) {   // the submit thread, when the frame it replays changes: what is committed now belongs to earlier frames
     atomic_store(&g_fa_floor, atomic_load(&g_fence));
+    { static double ema; static uint64_t seen; for (uint64_t k = f > 2 ? f - 2 : 0; k > seen && k + 12 > f; k--) { double g = mtl_gpu_ms(k); if (g > 0) { ema = ema > 0 ? ema + 0.1 * (g - ema) : g; seen = k; atomic_store_explicit(&g_fa_gpu_us, (uint32_t)(ema * 1000), memory_order_relaxed); break; } } }
     static uint64_t p[12]; uint64_t v[12] = {g_fa_inplace_vol, atomic_load(&g_fa_ahead_n), atomic_load(&g_fa_real_n), g_fa_snap_n, g_fa_snap_bytes, g_fa_binds, g_fa_prot, atomic_load(&g_fa_gate_n), atomic_load(&g_fa_gate_ns), g_fa_blocks, atomic_load(&g_fa_gate_late), atomic_load(&g_fa_skip)};
     if (f && !(f % 600)) { double n = 600.0;
         MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB), on volatile pages but read in place for a GPU write still to come %.1f; ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); by what read the page in place: uniform %llu, vertex %llu, index %llu, pointer or storage %llu, a block with a GPU write to come %llu (totals); submissions the wait must cover %.2f; acquires that skipped the display tick %.2f; volatile pages %llu; table full %llu, gate timeouts %llu",
