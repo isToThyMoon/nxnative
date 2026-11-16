@@ -286,6 +286,19 @@ static void ws_report(uint64_t frame, uint64_t frames) {
     MLOG("[waits] up to frame %llu, per frame:%s", (unsigned long long)frame, o ? line : " none");
 }
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
+// DM_NVN_FA_THREAD=1: with frame ahead and deferred encoding, the encode thread places the uniform blocks of argument tables (in place or a copy: fxt_cbuf, the port of
+// fa_cbuf) instead of the submit thread, which was a sixth of its time in Breath of the Wild. The submit thread writes the block's address in place into the slot and
+// records the request; the encode thread, which meets the requests in the submit thread's order, writes the copy's address over it. What the answer depends on within a
+// submission (the writes queued, the GPU writes noted) reaches the encode thread as records too, so it keeps its own lists and shares none with the submit thread; what
+// earlier submissions left (gw, hw, um tables) changes only in mtl_sub_commit, which first waits for the encode thread. check = the submit thread still places every
+// block and the encode thread only compares its answer (the [ahead] line counts the differences)
+static int g_fxt_mode = -1;
+__attribute__((noinline)) static int fxt_mode_init(void) {
+    const char *e = getenv("DM_NVN_FA_THREAD"); g_fxt_mode = !e || !rec_on() ? 0 : !strcmp(e, "check") ? 2 : atoi(e) > 0;
+    if (g_fxt_mode) MLOG("DM_NVN_FA_THREAD=%s: the encode thread %s", e, g_fxt_mode == 2 ? "places every frame-ahead uniform block a second time and compares (check)" : "places the frame-ahead uniform blocks of argument tables");
+    return g_fxt_mode;
+}
+static inline int fxt_rec(void) { return __builtin_expect(g_fxt_mode >= 0, 1) ? g_fxt_mode : fxt_mode_init(); }
 static NSHashTable *g_res_objects;
 static _Atomic unsigned g_image_heap_n, g_big_n;   // g_big_n: large pools in chunks, whose buffers overlap (BIG_MIN)
 static inline MTL4VisibilityOptions resource_vis(void) { return MTL4VisibilityOptionDevice | (g_image_heap_n || g_big_n ? MTL4VisibilityOptionResourceAlias : 0); }
@@ -1355,7 +1368,7 @@ static void drw_note(uint64_t lo, uint64_t n);   // the writes since the last dr
 static void vk_gpu_write(uint64_t dst, uint64_t n);   // kept vertex conversions of the written range are dropped (vk_get); n = 0: a write anywhere
 static void sbw_note(uint64_t lo, uint64_t n, int src) {
     if (src==SBW_GPU) rc_gpu_write(lo,n);
-    if (src == SBW_GPU) { g_sbw_gen++; drw_note(lo, n); vk_gpu_write(lo, n); }
+    if (src == SBW_GPU) { g_sbw_gen++; drw_note(lo, n); vk_gpu_write(lo, n); if (fxt_rec()) { rec_t *r = rec_put(RO_FX_SBW, 0); r->a[0] = lo; r->a[1] = n; } }
     if (!n) { if (src == SBW_GPU) g_sbw_over = 1; return; }
     uint64_t hi = lo + n;
     if (src == SBW_GPU && ((hi - 1) >> 12) - (lo >> 12) >= SBW_WPAGES) {   // a report is 16 bytes, never wide
@@ -1382,10 +1395,11 @@ static uint64_t ucb_handle(uint64_t addr, uint64_t size) { uint64_t s = (size + 
 static uint64_t ucb_handle_addr(uint64_t v) { return v >> 45 ? (v & ((1ull << 45) - 1)) << 4 : v; }
 static uint64_t sbw_len(uint64_t size, void *mb, uint64_t mo) { if (size) return size; uint64_t len = ((__bridge id<MTLBuffer>)mb).length; return len > mo ? len - mo : 0; }
 static inline unsigned pend_bucket(uint64_t page) { return (unsigned)((page * 0x9E3779B97F4A7C15ull) >> (64 - PEND_HB_BITS)); }
-static void pend_reset(void) { g_nhw_sub = 0; g_npend =g_pend_over = g_nupd = g_npnode = g_nwide = g_nsbw = g_nsbw_w = g_sbw_over = 0; if (!++g_pend_gen) { memset(g_pend_hgen, 0, sizeof g_pend_hgen); memset(g_sbwp, 0, sizeof g_sbwp); g_pend_gen = 1; } }
+static void pend_reset(void) { if (fxt_rec()) rec_put(RO_FX_RESET, 0); g_nhw_sub = 0; g_npend =g_pend_over = g_nupd = g_npnode = g_nwide = g_nsbw = g_nsbw_w = g_sbw_over = 0; if (!++g_pend_gen) { memset(g_pend_hgen, 0, sizeof g_pend_hgen); memset(g_sbwp, 0, sizeof g_sbwp); g_pend_gen = 1; } }
 static void vc_gpu_write(uint64_t dst, uint64_t n);   // kept index ranges under the written range are not trusted again (ix_range)
 static int pend_add(uint64_t dst, uint64_t n, int kind) {
     vc_gpu_write(dst, n); drw_note(dst, n ? n : 1);
+    if (fxt_rec()) { rec_t *r = rec_put(RO_FX_PEND, 0); r->a[0] = dst; r->a[1] = n; r->a[2] = (uint64_t)kind; }   // the encode thread keeps its own list (fxt_pend_add)
     if (g_pend_over) return -1;
     uint64_t p0 = dst >> 12, p1 = (dst + (n ? n : 1) - 1) >> 12; int narrow = p1 - p0 < PEND_SPAN;
     if (!pend_room(narrow ? (int)(p1 - p0 + 1) : 0)) { g_pend_over = 1; return -1; }
@@ -2149,7 +2163,8 @@ void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
         res_add(g_ubs_buf); g_ubs_off = 0;
     }
     memcpy((uint8_t *)g_ubs_buf.contents + g_ubs_off, data, n);
-    if (pi >= 0) { g_upd[g_nupd] = (upd_ent){dst, g_ubs_off, g_ubs_buf}; g_pend_upd[pi] = (uint32_t)++g_nupd; }
+    if (pi >= 0) { g_upd[g_nupd] = (upd_ent){dst, g_ubs_off, g_ubs_buf}; g_pend_upd[pi] = (uint32_t)++g_nupd;
+        if (fxt_rec()) { rec_t *r = rec_put(RO_FX_PEND, 0); r->a[0] = (uint64_t)(uintptr_t)((uint8_t *)g_ubs_buf.contents + g_ubs_off); r->a[2] = 255; } }   // the bytes of the entry recorded in pend_add
     if (defer) {
         // A deferred update this one covers whole never needs to land: the same landing writes these bytes after it, and the draws that read it hold its ring copy (ubd_shadow).
         // Games rewrite one block before every draw group (Breath of the Wild: the same 64 bytes), so the list stays short: every lookup below scans it, for most bindings of most draws
@@ -2633,6 +2648,7 @@ uint64_t mtl_sub_commit(void) {
     treg_finish_submission();   // Late descriptor views retire behind this submission's fence.
     rt_preserve_bound();   // The game may reuse completed command memory; queue bindings must not point into its texture snapshots.
     queue_program_preserve(); // Submitted metadata may retire while these programs remain bound.
+    if (fxt_rec()) rec_drain();   // the encode thread has placed every block of this submission: it reads g_fence, the tables gw_commit writes and the arenas
     uint64_t fence = ++g_fence;
     if (g_nvs) { post((post_op){3, NULL, VIS_FOLD, 0, 0, 0, vis_snapshot()}); vis_clear(); }   // this submission's slots after its last report: read at its completion (Occlusion queries)
     gw_commit(fence); rc_commit(fence);
@@ -6190,7 +6206,7 @@ static void shmap_read(void) {
     int gs_loc, lay_loc; char gs_comp, lay_comp;   // a slice-writing geometry shader (no function: the layer comes from input gs_loc.gs_comp) / a vertex shader with layer entry points writing output lay_loc.lay_comp (dmsh_build.py gs_slice, vs_layer_entry); -1 = none
     uint64_t cbs_seen; uint32_t cbs_runs;   // the command buffer that listed this shader last, and how many have (cbs_note)
     // The argument buffer encoded last time
-    uint64_t am_fence, am_ep, am_ubdv, am_pool; int am_npend; uint32_t am_pgen, am_sz[14]; uint8_t am_ok; struct { uint64_t addr, size; } am_ub[16];   // the patch path's memo (encode_args_): what each uniform slot of ab_buf was resolved for
+    uint64_t am_fence, am_ep, am_ubdv, am_pool; int am_npend; uint32_t am_pgen, am_sz[14]; uint8_t am_ok; uint16_t am_fx; struct { uint64_t addr, size, gpu, ul; } am_ub[16];   // the patch path's memo (encode_args_): what each uniform slot of ab_buf was resolved for
     uint8_t ab_cbuf_only;   // 0 not decided, 1: its only bindings read through a uniform buffer are plain CBUF slots (args_cbuf_only), so a block can be patched when only those changed; 2 not
     id<MTLBuffer> ab_buf; uint64_t ab_gpu; size_t ab_off; uint64_t ab_pass; uint32_t ab_binst; uint64_t ab_pgen;   // ab_pass: serial of the render pass that encoded this argument block - reused only within the same pass (the arena holding a block from another pass / another submission may already have been reclaimed and rewritten); ab_pgen: g_psnap_gen when it was encoded (pools, pool_gpu)
     id<MTLLibrary> bflib; int bflib_state; NSMutableArray *bffn;   // bflib: the readable-tile version <key>_bf (state as afn_state), bffn: its functions specialized by their numbers (NvBfFn, bf_fn)
@@ -7399,6 +7415,7 @@ static inline __attribute__((always_inline)) void *samp_fast(int sid) {
 @interface NvArena : NSObject { @public id<MTLBuffer> buf; uint8_t *cpu; uint64_t gpu, fence; size_t used, len; } @end   // len: buf.length and cpu: buf.contents, kept so an allocation and its writes send no message
 @implementation NvArena @end
 static NSMutableArray<NvArena *> *g_arenas; static NvArena *g_cur_arena; static NSMutableArray<NvArena *> *g_sub_arenas;
+static NvArena *g_fxt_arena; static NSMutableArray<NvArena *> *g_fxt_sub_arenas;   // the encode thread's copies (fxt_alloc); it is idle whenever the submit thread touches these lists (arena_begin, arena_commit)
 static NvArena *arena_new(size_t minimum) {
     // The for-in loop variable does not retain the object: take a strong reference first and then remove it from the array, otherwise what is returned after the array releases it is a dangling pointer
     NvArena *r = nil;   // the smallest one that fits, so the usual small requests do not keep a large scratch arena alive (ARENA_IDLE, arena_begin)
@@ -7414,13 +7431,14 @@ static NvArena *arena_new(size_t minimum) {
 // them again and took 300 ms. The usual 4 MB blocks are always kept
 enum { ARENA_KEEP = 32 << 20, ARENA_IDLE = 600 };
 void arena_begin(void) {
-    if (!g_arenas) { g_arenas = [NSMutableArray array]; g_sub_arenas = [NSMutableArray array]; }
+    if (!g_arenas) { g_arenas = [NSMutableArray array]; g_sub_arenas = [NSMutableArray array]; g_fxt_sub_arenas = [NSMutableArray array]; }
     g_cur_arena = nil;
     uint64_t done = g_done;   // read as the submission start does (its allocator and visibility ring)
     for (NSUInteger i = g_arenas.count; i-- > 0;) { NvArena *a = g_arenas[i];
         if (a->fence && a->fence <= done && a->len > ARENA_KEEP && g_fence > a->fence + ARENA_IDLE) { res_remove(a->buf); [g_arenas removeObjectAtIndex:i]; } }
 }
-void arena_commit(uint64_t fence) { for (NvArena *a in g_sub_arenas) { a->fence = fence; [g_arenas addObject:a]; } [g_sub_arenas removeAllObjects]; g_cur_arena = nil; }
+void arena_commit(uint64_t fence) { for (NvArena *a in g_sub_arenas) { a->fence = fence; [g_arenas addObject:a]; } [g_sub_arenas removeAllObjects]; g_cur_arena = nil;
+    for (NvArena *a in g_fxt_sub_arenas) { a->fence = fence; [g_arenas addObject:a]; } [g_fxt_sub_arenas removeAllObjects]; g_fxt_arena = nil; }
 // An unqualified id * out-parameter is __autoreleasing under ARC; __strong avoids autoreleasing the arena buffer at every allocation.
 // Measurements: docs/reference/frame-rate.md, Arena buffer ownership on allocation.
 static size_t arena_alloc(size_t n, __strong id<MTLBuffer> *buf) {
@@ -11434,8 +11452,10 @@ static void fa_readback(void) { if (fa_on()) { g_fa_readbacks++; fa_block(); } }
 static uint64_t g_fa_small_rb;
 static void fa_small_readback(void) { if (g_fa_mode > 0) g_fa_small_rb++; }
 // A zero-copy binding of [lo, hi): its pages are read by the submission being replayed, and protected so that a write passes the gate
-static void fa_bind(uint64_t lo, uint64_t hi) {
-    static struct { uint64_t lo, hi, f; } ded[FA_DED];
+typedef struct { uint64_t lo, hi, f; } fa_ded;
+static void fa_bind_in(uint64_t lo, uint64_t hi, fa_ded *ded, int kind);
+static void fa_bind(uint64_t lo, uint64_t hi) { static fa_ded ded[FA_DED]; fa_bind_in(lo, hi, ded, g_fa_kind); }
+static void fa_bind_in(uint64_t lo, uint64_t hi, fa_ded *ded, int kind) {   // ded: the caller thread's own answers (the submit thread's, or the encode thread's: fxt_cbuf)
     if (hi <= lo) return;
     if (hi - lo > (256ull << 20)) { fa_block(); return; }
     uint64_t f = atomic_load(&g_fence) + 1; uint32_t fr = (uint32_t)atomic_load_explicit(&g_cur_frame, memory_order_relaxed);
@@ -11444,7 +11464,7 @@ static void fa_bind(uint64_t lo, uint64_t hi) {
     int need = 0; g_fa_binds++;
     for (uint64_t pg = lo >> 14; pg <= (hi - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 1);
         if (!e) { g_fa_full++; fa_block(); return; }
-        atomic_store(&e->fence, f); atomic_store(&e->frame, fr); atomic_store_explicit(&e->kind, (uint8_t)g_fa_kind, memory_order_relaxed);
+        atomic_store(&e->fence, f); atomic_store(&e->frame, fr); atomic_store_explicit(&e->kind, (uint8_t)kind, memory_order_relaxed);
         if (!atomic_exchange(&e->prot, 1)) need = 1; }   // set before the protection lands: a write after it clears the flag again in the gate
     if (need) { uint64_t a = lo & ~0x3fffull, b = (hi + 0x3fff) & ~0x3fffull;
         if (!nvn_dirty_tracked((const void *)(uintptr_t)lo, (size_t)(hi - lo))) { fa_block(); for (uint64_t pg = lo >> 14; pg <= (hi - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e) atomic_store(&e->prot, 0); } return; }
@@ -11484,6 +11504,166 @@ static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MT
     ded[k].gpu = g_cur_arena->gpu + o; ded[k].buf = (__bridge void *)ab; ded[k].state = 2;
     *use = ab; return ded[k].gpu;
 }
+// ---------- DM_NVN_FA_THREAD: the encode thread's side (see fxt_mode_init). Everything below down to fxt_exec runs on the encode thread only ----------
+// Its lists of the submission's queued writes and noted GPU writes, built from the records in the order the submit thread made them: at a request they hold what the submit
+// thread's lists held when it recorded the request (pend_add, sbw_note; the same structure and limits, so the same answers)
+typedef struct { uint64_t lo, hi; const uint8_t *src; uint8_t kind; } fxt_pe;   // src: an inline update's bytes in the update ring (kept until the submission completes)
+static fxt_pe *g_fxp; static int g_fxt_np, g_fxt_pcap, g_fxt_over, g_fxt_last = -1;
+static int32_t g_fxt_head[PEND_HB]; static uint32_t g_fxt_hgen[PEND_HB], g_fxt_gen = 1;
+static pend_node *g_fxt_node; static int g_fxt_nnode, g_fxt_ncap; static int *g_fxt_idx;
+static int32_t g_fxt_wide[PEND_WIDE]; static int g_fxt_nwide;
+static struct { uint64_t page, cells; uint32_t gen; } g_fxt_sbwp[SBW_N]; static int g_fxt_nsbw, g_fxt_sbw_over, g_fxt_nsbw_w; static uint64_t g_fxt_wlo[SBW_WN], g_fxt_whi[SBW_WN]; static uint32_t g_fxt_sbw_gen;
+static uint64_t g_fxt_req, g_fxt_snap_n, g_fxt_snap_bytes, g_fxt_inplace_vol, g_fxt_chk_n, g_fxt_chk_kind[2], g_fxt_chk_bytes;   // written here, read by the submit thread's [ahead] line
+static void fxt_reset(void) {
+    g_fxt_np = g_fxt_over = g_fxt_nnode = g_fxt_nwide = g_fxt_nsbw = g_fxt_nsbw_w = g_fxt_sbw_over = 0; g_fxt_last = -1;
+    if (!++g_fxt_gen) { memset(g_fxt_hgen, 0, sizeof g_fxt_hgen); memset(g_fxt_sbwp, 0, sizeof g_fxt_sbwp); g_fxt_gen = 1; }
+}
+static void fxt_pend_add(uint64_t dst, uint64_t n, int kind) {
+    g_fxt_last = -1;
+    if (g_fxt_over) return;
+    uint64_t p0 = dst >> 12, p1 = (dst + (n ? n : 1) - 1) >> 12; int narrow = p1 - p0 < PEND_SPAN, nodes = narrow ? (int)(p1 - p0 + 1) : 0;
+    if (g_fxt_np == g_fxt_pcap) { int c = g_fxt_pcap ? g_fxt_pcap * 2 : 4096; void *q = c > 0 ? realloc(g_fxp, (size_t)c * sizeof *g_fxp) : NULL; if (!q) { g_fxt_over = 1; return; } g_fxp = q; g_fxt_pcap = c; }
+    if (!g_fxt_ncap || g_fxt_nnode + nodes > g_fxt_ncap) { int c = g_fxt_ncap ? g_fxt_ncap : 8192; while (c < g_fxt_nnode + nodes) { if (c > INT_MAX / 2) { g_fxt_over = 1; return; } c *= 2; }
+        void *q = realloc(g_fxt_node, (size_t)c * sizeof *g_fxt_node); if (q) g_fxt_node = q;
+        void *q2 = q ? realloc(g_fxt_idx, ((size_t)c + PEND_WIDE) * sizeof *g_fxt_idx) : NULL; if (q2) g_fxt_idx = q2;
+        if (!q || !q2) { g_fxt_over = 1; return; }
+        g_fxt_ncap = c; }
+    int e = g_fxt_np;
+    if (narrow)
+        for (uint64_t pg = p0; pg <= p1; pg++) { unsigned b = pend_bucket(pg); int k = g_fxt_nnode++;
+            g_fxt_node[k].e = e; g_fxt_node[k].next = g_fxt_hgen[b] == g_fxt_gen ? g_fxt_head[b] : -1; g_fxt_head[b] = k; g_fxt_hgen[b] = g_fxt_gen; }
+    else if (g_fxt_nwide < PEND_WIDE) g_fxt_wide[g_fxt_nwide++] = e;
+    else { g_fxt_over = 1; return; }
+    g_fxp[e] = (fxt_pe){dst, dst + n, NULL, (uint8_t)kind}; g_fxt_last = g_fxt_np++;
+}
+static int fxt_pend_since(uint64_t a, uint64_t b, int since, int *out) {   // pend_since
+    if (g_fxt_over) return -1;
+    int n = 0; uint64_t p0 = a >> 12, p1 = (b - 1) >> 12;
+    if (p1 - p0 >= PEND_SPAN) { for (int e = g_fxt_np - 1; e >= since; e--) if (a < g_fxp[e].hi && g_fxp[e].lo < b) out[n++] = e; return n; }
+    for (int i = 0; i < g_fxt_nwide; i++) { int e = g_fxt_wide[i]; if (e >= since && a < g_fxp[e].hi && g_fxp[e].lo < b) out[n++] = e; }
+    for (uint64_t pg = p0; pg <= p1; pg++) { unsigned bk = pend_bucket(pg); if (g_fxt_hgen[bk] != g_fxt_gen) continue;
+        for (int k = g_fxt_head[bk]; k >= 0 && g_fxt_node[k].e >= since; k = g_fxt_node[k].next) { int e = g_fxt_node[k].e; if (a < g_fxp[e].hi && g_fxp[e].lo < b) out[n++] = e; } }
+    if (n > 1 && (g_fxt_nwide || p1 > p0)) {
+        for (int i = 1; i < n; i++) { int v = out[i], j = i; while (j > 0 && out[j - 1] < v) { out[j] = out[j - 1]; j--; } out[j] = v; }
+        int m = 1; for (int i = 1; i < n; i++) if (out[i] != out[m - 1]) out[m++] = out[i];
+        n = m; }
+    return n;
+}
+static int fxt_sbw_slot(uint64_t pg, int add) {
+    unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 50) & (SBW_N - 1);
+    for (int i = 0; i < 64; i++, h = (h + 1) & (SBW_N - 1)) {
+        if (g_fxt_sbwp[h].gen != g_fxt_gen) { if (!add) return -1; g_fxt_sbwp[h].page = pg; g_fxt_sbwp[h].gen = g_fxt_gen; g_fxt_sbwp[h].cells = 0; g_fxt_nsbw++; return (int)h; }
+        if (g_fxt_sbwp[h].page == pg) return (int)h; }
+    return -1;
+}
+static void fxt_sbw_note(uint64_t lo, uint64_t n) {   // sbw_note for a GPU write
+    g_fxt_sbw_gen++;
+    if (!n) { g_fxt_sbw_over = 1; return; }
+    uint64_t hi = lo + n;
+    if (((hi - 1) >> 12) - (lo >> 12) >= SBW_WPAGES) {
+        for (int i = 0; i < g_fxt_nsbw_w; i++) if (lo <= g_fxt_whi[i] && g_fxt_wlo[i] <= hi) { g_fxt_wlo[i] = MIN(lo, g_fxt_wlo[i]); g_fxt_whi[i] = MAX(hi, g_fxt_whi[i]); return; }
+        if (g_fxt_nsbw_w == SBW_WN) { g_fxt_sbw_over = 1; return; }
+        g_fxt_wlo[g_fxt_nsbw_w] = lo; g_fxt_whi[g_fxt_nsbw_w++] = hi; return;
+    }
+    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { int k = fxt_sbw_slot(pg, 1); if (k < 0) { g_fxt_sbw_over = 1; return; } g_fxt_sbwp[k].cells |= cell_mask(lo, hi, pg); }
+}
+static int fxt_sbw_hits(uint64_t lo, uint64_t hi) {
+    for (int i = 0; i < g_fxt_nsbw_w; i++) if (lo < g_fxt_whi[i] && g_fxt_wlo[i] < hi) return 1;
+    if (!g_fxt_nsbw) return 0;
+    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { int k = fxt_sbw_slot(pg, 0); if (k >= 0 && (g_fxt_sbwp[k].cells & cell_mask(lo, hi, pg))) return 1; }
+    return 0;
+}
+static uint8_t *fxt_alloc(size_t n, uint64_t *gpu) {   // from the encode thread's own arenas (arena_alloc is the submit thread's)
+    n = (n + 255) & ~(size_t)255;
+    if (!g_fxt_arena || g_fxt_arena->used + n > g_fxt_arena->len) {
+        pthread_mutex_lock(&g_mu); g_fxt_arena = arena_new(n); pthread_mutex_unlock(&g_mu);
+        [g_fxt_sub_arenas addObject:g_fxt_arena];
+    }
+    size_t off = g_fxt_arena->used; g_fxt_arena->used += n; *gpu = g_fxt_arena->gpu + off; return g_fxt_arena->cpu + off;
+}
+// ubp_get, copying at once: the bytes [lo, hi) as the GPU will read them at this point of the submission, or 0 when they cannot be known
+typedef struct { uint64_t lo, hi, gpu; uint8_t *cpu; int npend; uint32_t gen, sbw; } fxt_ubp_ent;
+static int fxt_ubp(uint64_t lo, uint64_t hi, uint64_t *gpu, uint8_t **cpu) {
+    static fxt_ubp_ent cache[UBP_CACHE]; static unsigned cache_i;
+    if (!ub_partial_on() || hi <= lo || hi - lo > UBP_MAX_BYTES) return 0;
+    fxt_ubp_ent *c = NULL;
+    for (int i = 0; i < UBP_CACHE; i++) if (cache[i].lo == lo && cache[i].hi == hi && cache[i].gen == g_fxt_gen) { c = &cache[i]; break; }
+    if (!c || c->sbw != g_fxt_sbw_gen) { if (g_fxt_sbw_over || fxt_sbw_hits(lo, hi)) return 0; if (c) c->sbw = g_fxt_sbw_gen;
+        if (g_gml_on) { pthread_mutex_lock(&g_gsr_mu); uint64_t i = g_gsr_n++ % GSR_N; g_gsr[i].fence = atomic_load(&g_fence) + 1; g_gsr[i].lo = lo; g_gsr[i].hi = hi; pthread_mutex_unlock(&g_gsr_mu); } }
+    if (c && c->npend == g_fxt_np) { *gpu = c->gpu; *cpu = c->cpu; return 1; }
+    int since = c ? c->npend : 0;
+    if (!c && (gw_live_in(g_gwx, lo, hi) || hw_live(lo, hi) || !nvn_host_readable(lo, hi - lo))) return 0;
+    int n = fxt_pend_since(lo, hi, since, g_fxt_idx); if (n < 0) return 0;
+    enum { COVN = 64 }; uint64_t cl[COVN], ch[COVN]; int nc = 0, nk = 0, exact = 1;
+    for (int i = 0; i < n; i++) { int e = g_fxt_idx[i];
+        uint64_t x = g_fxp[e].lo > lo ? g_fxp[e].lo : lo, y = g_fxp[e].hi < hi ? g_fxp[e].hi : hi;
+        int j = 0; while (j < nc && ch[j] < y) j++;
+        if (exact && j < nc && cl[j] <= x && y <= ch[j]) continue;
+        if (g_fxp[e].kind != 1 || !g_fxp[e].src) return 0;
+        g_fxt_idx[nk++] = e;
+        if (exact) {
+            int k = 0; while (k < nc && ch[k] < x) k++;
+            int m = k; uint64_t nl = x, nh = y; while (m < nc && cl[m] <= y) { nl = MIN(nl, cl[m]); nh = MAX(nh, ch[m]); m++; }
+            if (nc - (m - k) + 1 > COVN) exact = 0;
+            else { memmove(&cl[k + 1], &cl[m], (nc - m) * sizeof *cl); memmove(&ch[k + 1], &ch[m], (nc - m) * sizeof *ch); nc = nc - (m - k) + 1; cl[k] = nl; ch[k] = nh;
+                   if (nc == 1 && cl[0] == lo && ch[0] == hi) break; } } }
+    uint64_t len = hi - lo, g; uint8_t *d = fxt_alloc((size_t)len, &g);
+    memcpy(d, c ? c->cpu : (const uint8_t *)(uintptr_t)lo, (size_t)len);
+    if (!c) um_overlay(lo, hi, d, 0);
+    for (int i = nk - 1; i >= 0; i--) { int e = g_fxt_idx[i];
+        uint64_t x = g_fxp[e].lo > lo ? g_fxp[e].lo : lo, y = g_fxp[e].hi < hi ? g_fxp[e].hi : hi;
+        memcpy(d + (x - lo), g_fxp[e].src + (x - g_fxp[e].lo), (size_t)(y - x)); }
+    if (!c) c = &cache[cache_i++ % UBP_CACHE];
+    *c = (fxt_ubp_ent){lo, hi, g, d, g_fxt_np, g_fxt_gen, g_fxt_sbw_gen};
+    *gpu = g; *cpu = d; return 1;
+}
+// fa_cbuf: ep is the replayed list the request was recorded in (g_fa_epoch then); *cpu the copy's bytes, NULL when the block is read in place
+static uint64_t fxt_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, uint64_t ep, uint8_t **cpu, int count) {
+    enum { CN = 16384 };
+    static struct { uint64_t addr, ul, ep, fence, gpu; uint8_t *cpu; int npend; uint32_t pgen; uint8_t state; } ded[CN];
+    static fa_ded bound[FA_DED];
+    *cpu = NULL;
+    if (!ul) return gpu;
+    uint64_t fn = atomic_load_explicit(&g_fence, memory_order_relaxed);
+    unsigned k = (unsigned)(((addr * 0x9E3779B97F4A7C15ull) ^ (ul * 0xC2B2AE3D27D4EB4Full)) >> 50) & (CN - 1);
+    if (ded[k].state && ded[k].addr == addr && ded[k].ul == ul && ded[k].ep == ep && ded[k].fence == fn && ded[k].pgen == g_fxt_gen) {
+        if (ded[k].npend != g_fxt_np) { int n = ded[k].npend <= g_fxt_np ? fxt_pend_since(addr, addr + ul, ded[k].npend, g_fxt_idx) : -1; if (n == 0) ded[k].npend = g_fxt_np; else ded[k].state = 0; }
+        if (ded[k].state == 1) return gpu;
+        if (ded[k].state == 2) { *cpu = ded[k].cpu; return ded[k].gpu; } }
+    ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = ep; ded[k].fence = fn; ded[k].npend = g_fxt_np; ded[k].pgen = g_fxt_gen; ded[k].state = 1; ded[k].gpu = 0; ded[k].cpu = NULL;
+    int vol = 0;
+    for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && atomic_load_explicit(&e->vol, memory_order_relaxed)) { vol = 1; break; } }
+    if (!vol) { fa_bind_in(addr, addr + ul, bound, FA_K_UNI); return gpu; }
+    { uint64_t g; uint8_t *c;
+      if (fxt_ubp(addr, addr + ul, &g, &c)) { if (count) { g_fxt_snap_n++; g_fxt_snap_bytes += ul; } ded[k].gpu = g; ded[k].cpu = c; ded[k].state = 2; *cpu = c; return g; } }
+    if (g_fxt_sbw_over || fxt_sbw_hits(addr, addr + ul) || gw_live(addr, addr + ul) || hw_live(addr, addr + ul) || !nvn_host_readable(addr, ul)) { if (count) g_fxt_inplace_vol++; fa_bind_in(addr, addr + ul, bound, FA_K_GPUW); return gpu; }
+    uint64_t g; uint8_t *d = fxt_alloc((size_t)ul, &g);
+    memcpy(d, (const void *)(uintptr_t)addr, (size_t)ul);
+    if (count) { g_fxt_snap_n++; g_fxt_snap_bytes += ul; }
+    ded[k].gpu = g; ded[k].cpu = d; ded[k].state = 2; *cpu = d;
+    return g;
+}
+static void fxt_exec(const uint32_t op, const uint64_t *a) {
+    switch (op) {
+    case RO_FX_RESET: fxt_reset(); break;
+    case RO_FX_PEND: if (a[2] == 255) { if (g_fxt_last >= 0) g_fxp[g_fxt_last].src = (const uint8_t *)(uintptr_t)a[0]; } else fxt_pend_add(a[0], a[1], (int)a[2]); break;
+    case RO_FX_SBW: fxt_sbw_note(a[0], a[1]); break;
+    case RO_FX_CBUF: { uint8_t *c; uint64_t v = fxt_cbuf(a[1], a[2], a[3], a[4], &c, !a[5]);
+        if (!a[5]) { g_fxt_req++; if (v != a[3]) *(uint64_t *)(uintptr_t)a[0] = v; break; }
+        // check: a[5] is 1 when the submit thread read the block in place, else its copy's bytes (2: not found)
+        g_fxt_chk_n++; int there = a[5] != 1, here = v != a[3];
+        if (here != there) g_fxt_chk_kind[there]++;
+        else if (here && a[5] > 2 && c && memcmp(c, (const void *)(uintptr_t)a[5], (size_t)a[2])) g_fxt_chk_bytes++;
+        break; }
+    }
+}
+// ---------- the submit thread again ----------
+typedef struct { uint64_t addr, ul, gpu, sync; int on; } fxt_req;   // a uniform block left to the encode thread (on 1), or placed here and to be compared there (on 2: sync is the address it got)
+static void fxt_put(uint64_t *slot, const fxt_req *q) {
+    rec_t *r = rec_put(RO_FX_CBUF, 0); r->a[0] = (uint64_t)(uintptr_t)slot; r->a[1] = q->addr; r->a[2] = q->ul; r->a[3] = q->gpu; r->a[4] = g_fa_epoch; r->a[5] = 0;
+    if (q->on == 2) { r->a[5] = q->sync == q->gpu ? 1 : 2;
+        if (q->sync != q->gpu) for (NvArena *x in g_sub_arenas) if (q->sync >= x->gpu && q->sync - x->gpu < x->len) { r->a[5] = (uint64_t)(uintptr_t)(x->cpu + (q->sync - x->gpu)); break; } }
+}
 // A draw's vertex, index and indirect buffers are read in place (its shaders' buffers are placed where their arguments are encoded: cbuf_slot, encode_args_)
 static void fa_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     g_fa_kind = FA_K_VTX; for (int s_ = 0; s_ < 16; s_++) if (S.vbuf[s_].address && (S.vbuf[s_].size > (16u << 10) || !S.vbuf[s_].size)) fa_bind(S.vbuf[s_].address, S.vbuf[s_].address + (S.vbuf[s_].size ? S.vbuf[s_].size : 1));   // smaller ones: bind_vbufs
@@ -11511,7 +11691,7 @@ static void fa_ptr_note(int stage, int reg, int rw, int ubop, uint64_t addr, uin
 static void fa_frame(uint64_t f) {   // the submit thread, when the frame it replays changes: what is committed now belongs to earlier frames
     atomic_store(&g_fa_floor, atomic_load(&g_fence));
     { static double ema; static uint64_t seen; for (uint64_t k = f > 2 ? f - 2 : 0; k > seen && k + 12 > f; k--) { double g = mtl_gpu_ms(k); if (g > 0) { ema = ema > 0 ? ema + 0.1 * (g - ema) : g; seen = k; atomic_store_explicit(&g_fa_gpu_us, (uint32_t)(ema * 1000), memory_order_relaxed); break; } } }
-    static uint64_t p[12]; uint64_t v[12] = {g_fa_inplace_vol, atomic_load(&g_fa_ahead_n), atomic_load(&g_fa_real_n), g_fa_snap_n, g_fa_snap_bytes, g_fa_binds, g_fa_prot, atomic_load(&g_fa_gate_n), atomic_load(&g_fa_gate_ns), g_fa_blocks, atomic_load(&g_fa_gate_late), atomic_load(&g_fa_skip)};
+    static uint64_t p[12]; uint64_t v[12] = {g_fa_inplace_vol + g_fxt_inplace_vol, atomic_load(&g_fa_ahead_n), atomic_load(&g_fa_real_n), g_fa_snap_n + g_fxt_snap_n, g_fa_snap_bytes + g_fxt_snap_bytes, g_fa_binds, g_fa_prot, atomic_load(&g_fa_gate_n), atomic_load(&g_fa_gate_ns), g_fa_blocks, atomic_load(&g_fa_gate_late), atomic_load(&g_fa_skip)};
     if (f && !(f % 600)) { double n = 600.0;
         MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB), on volatile pages but read in place for a GPU write still to come %.1f; ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); by what read the page in place: uniform %llu, vertex %llu, index %llu, pointer or storage %llu, a block with a GPU write to come %llu (totals); submissions the wait must cover %.2f (reports that hold it so far %llu; samples-passed reports and small texture readbacks, which do not, %llu); acquires that skipped the display tick %.2f; volatile pages %llu; table full %llu, gate timeouts %llu",
              (unsigned long long)f, (v[1] - p[1]) / n, (v[2] - p[2]) / n, (v[3] - p[3]) / n, (v[4] - p[4]) / n / 1024.0, (v[0] - p[0]) / n, (v[5] - p[5]) / n, (v[6] - p[6]) / n, (v[7] - p[7]) / n, (v[8] - p[8]) / n / 1e6, (unsigned long long)atomic_load(&g_fa_gate_k[0]), (unsigned long long)atomic_load(&g_fa_gate_k[1]), (unsigned long long)atomic_load(&g_fa_gate_k[2]), (unsigned long long)atomic_load(&g_fa_gate_k[3]), (unsigned long long)atomic_load(&g_fa_gate_k[4]), (v[9] - p[9]) / n, (unsigned long long)g_fa_readbacks, (unsigned long long)g_fa_small_rb, (v[11] - p[11]) / n,
@@ -11519,6 +11699,9 @@ static void fa_frame(uint64_t f) {   // the submit thread, when the frame it rep
         { static uint64_t w0[6]; uint64_t w[6]; mtl_ubp_why(w);
           MLOG("[ahead] copies refused since the last line (the block is then read in place): too large or shadows off %llu, a shader's store to come %llu, a copy or fill of a running submission %llu, a copy or fill of this submission %llu, unreadable %llu, a report to land %llu; storage writes answered by a wide write %llu (the last %llu bytes wide), by a cell %llu, write set full now %d",
                (unsigned long long)(w[0] - w0[0]), (unsigned long long)(w[1] - w0[1]), (unsigned long long)(w[2] - w0[2]), (unsigned long long)(w[3] - w0[3]), (unsigned long long)(w[4] - w0[4]), (unsigned long long)(w[5] - w0[5]), (unsigned long long)g_sbw_hit_wide, (unsigned long long)g_sbw_wide_bytes, (unsigned long long)g_sbw_hit_cell, g_sbw_over); memcpy(w0, w, sizeof w0); g_sbw_hit_wide = g_sbw_hit_cell = 0; }
+        if (fxt_rec()) { static uint64_t q0[6]; uint64_t q[6] = {g_fxt_req, g_fxt_snap_n, g_fxt_chk_n, g_fxt_chk_kind[0], g_fxt_chk_kind[1], g_fxt_chk_bytes};
+            MLOG("[ahead] encode thread (DM_NVN_FA_THREAD), per frame: uniform blocks placed there %.0f (copied %.1f); check: compared %.0f, copied there but in place here %llu, in place there but copied here %llu, copies with other bytes %llu (since the last line)",
+                 (q[0] - q0[0]) / n, (q[1] - q0[1]) / n, (q[2] - q0[2]) / n, (unsigned long long)(q[3] - q0[3]), (unsigned long long)(q[4] - q0[4]), (unsigned long long)(q[5] - q0[5])); memcpy(q0, q, sizeof q0); }
         memcpy(p, v, sizeof p); }
 }
 // The game's wait on a fence (hle_nvn.c, nvn_queue.inc): with frame ahead on, a fence of the current frame is answered once the frames before it are complete, and the
@@ -11531,7 +11714,7 @@ int mtl_wait_ahead(uint64_t fence, uint64_t timeout_ns) {
     if (timeout_ns) atomic_fetch_add(&g_fa_ahead_n, 1);
     return need ? mtl_wait_at(need, timeout_ns, !timeout_ns ? WS_SYNC_POLL : WS_SYNC) : 1;
 }
-static uint64_t cbuf_slot(NvShader *sh, int nvn_stage, const nvn_rbind *b, __strong id<MTLBuffer> *use) {
+static uint64_t cbuf_slot(NvShader *sh, int nvn_stage, const nvn_rbind *b, __strong id<MTLBuffer> *use, fxt_req *fx) {   // fx: where a block left to the encode thread is described (NULL: placed here)
     int reg = b->reg; const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
     void *mb; uint64_t mo, gpu;
     if (!u || !u->addr || !mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) {   // reads 0 (the all-zero bank), as an unbound texture slot does, instead of through a null pointer
@@ -11548,7 +11731,9 @@ static uint64_t cbuf_slot(NvShader *sh, int nvn_stage, const nvn_rbind *b, __str
         uint64_t g; const uint8_t *c; if (ubd_covers(u->addr, u->addr + ul)) gpu = ubd_shadow(u->addr, u->addr + ul);
         else if (ubp_get(u->addr, u->addr + ul, &g, &c)) gpu = g;
         else RED_ONCE(92, "a uniform update deferred inside the pass covers only part of the binding (stage %d cb%d): the content before the update is read", nvn_stage, reg); }
-    else if (fa_on()) gpu = fa_cbuf(u->addr, ul, gpu, use);
+    else if (fa_on()) { int m = fx && ul ? fxt_rec() : 0;
+        if (m == 1) { fx->addr = u->addr; fx->ul = ul; fx->gpu = gpu; fx->on = 1; }   // the slot holds the address in place until the encode thread has placed the block
+        else { uint64_t g0 = gpu; gpu = fa_cbuf(u->addr, ul, gpu, use); if (m == 2) { fx->addr = u->addr; fx->ul = ul; fx->gpu = g0; fx->sync = gpu; fx->on = 2; } } }
     return gpu;
 }
 // The uniform slots' bound sizes (DMSH_CBSIZE_BANK), which the translator's reads at computed offsets compare with: one past its slot's size, rounded up to 256 bytes (ub_bound), gives 0, as on Maxwell. 0 for an unbound slot,
@@ -11632,10 +11817,16 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
         int same = memo_on && sh->am_ok && sh->am_fence == m_fence && sh->am_ep == g_fa_epoch && sh->am_ubdv == g_ubd_ver && sh->am_pool == m_pool && sh->am_npend == g_npend && sh->am_pgen == g_pend_gen;
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; id<MTLBuffer> use;
             if (b->kind == NVN_RB_CBUF) {
+                fxt_req q; q.on = 0;
                 if (b->reg < 16) { const p_bind_buf *u = &S.ubo[nvn_stage][b->reg];
-                    if (same && sh->am_ub[b->reg].addr == u->addr && sh->am_ub[b->reg].size == u->size) { g_stat_args_memo++; continue; }
+                    if (same && sh->am_ub[b->reg].addr == u->addr && sh->am_ub[b->reg].size == u->size) { g_stat_args_memo++;
+                        // a slot left to the encode thread: the copied block may hold either address, so the request is made again (the encode thread has the answer)
+                        if (sh->am_fx >> b->reg & 1) { q = (fxt_req){u->addr, sh->am_ub[b->reg].ul, sh->am_ub[b->reg].gpu, 0, 1}; p[b->aid] = q.gpu; fxt_put(&p[b->aid], &q); }
+                        continue; }
                     sh->am_ub[b->reg].addr = u->addr; sh->am_ub[b->reg].size = u->size; }
-                p[b->aid] = cbuf_slot(sh, nvn_stage, b, &use); }
+                p[b->aid] = cbuf_slot(sh, nvn_stage, b, &use, b->reg < 16 ? &q : NULL);
+                if (b->reg < 16) { if (q.on == 1) { sh->am_fx |= (uint16_t)(1u << b->reg); sh->am_ub[b->reg].gpu = q.gpu; sh->am_ub[b->reg].ul = q.ul; } else sh->am_fx &= (uint16_t)~(1u << b->reg); }
+                if (q.on) fxt_put(&p[b->aid], &q); }
             else if (b->kind == NVN_RB_CBSIZE) {
                 uint32_t sz[DMSH_CBSIZE_SLOTS]; for (int r = 0; r < DMSH_CBSIZE_SLOTS; r++) { const p_bind_buf *u = &S.ubo[nvn_stage][r]; sz[r] = u->addr ? u->size < 65536 ? (uint32_t)ub_bound(u->size) : 65536 : 0; }
                 if (same && !memcmp(sz, sh->am_sz, sizeof sz)) { g_stat_args_memo++; continue; }
@@ -11655,6 +11846,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
     int bl = passdump() && (bl_all || g_kd_force || bl_pass[nvn_stage] != g_stat_pass);
     if (bl) { bl_pass[nvn_stage] = g_stat_pass; PD("K %llu st%d key=%s nb=%d", g_stat_pass, nvn_stage, sh->key[0] ? sh->key : sh->builtin ? sh->builtin : "?", sh->rf.nb); }
     uint32_t bmask = 0; float bk[DMSH_BORDER_SAMPLERS][4];   // the border colour block (see nvn_border.h): the twins that correct, their factors
+    fxt_req fxq[16]; int fxa[16], nfx = 0;   // uniform blocks left to the encode thread: recorded once the block has its place in the arena
     os_unfair_lock_lock(&g_rmu);   // The texture / sampler registration tables may be being grown or rewritten by the game thread
     for (int i = 0; i < sh->rf.nb; i++) {
         const nvn_rbind *b = &sh->rf.b[i];
@@ -11662,7 +11854,8 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
         if (b->kind == NVN_RB_GEOMETRY) { slots[aid] = g_geo_bind[reg]; continue; }
         if (b->kind == NVN_RB_CBUF) {
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
-            id<MTLBuffer> use; slots[aid] = cbuf_slot(sh, nvn_stage, b, &use);
+            id<MTLBuffer> use; fxt_req q; q.on = 0; slots[aid] = cbuf_slot(sh, nvn_stage, b, &use, nfx < 16 ? &q : NULL);
+            if (q.on) { fxq[nfx] = q; fxa[nfx++] = aid; }
             USE(use, MTLResourceUsageRead);
             void *mb; uint64_t mo, g_;
             if (bl && u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &g_)) {
@@ -11936,6 +12129,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
     os_unfair_lock_unlock(&g_rmu);
     id<MTLBuffer> ab; size_t off = arena_alloc(arg_len, &ab);
     memcpy(g_cur_arena->cpu + off, slots, arg_len);
+    for (int i = 0; i < nfx; i++) fxt_put((uint64_t *)(void *)(g_cur_arena->cpu + off) + fxa[i], &fxq[i]);
     if (gmem_aid >= 0) gmem_slot_note((uint64_t *)(void *)(g_cur_arena->cpu + off) + gmem_aid, gml_taken ? (__bridge void *)g_gml_last : NULL);   // the arena arena_alloc took it from (no contents message: see ubo_read)
     bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
     sh->am_ok = 0;   // the patch path's memo describes the block it copies
@@ -17836,7 +18030,7 @@ void dm_gfx_teardown(void) { @autoreleasepool {
     g_ep = nil; g_arch_q = nil; g_arch_pending = nil;
     g_comp4 = nil; g_dlss_comp = nil; g_fx_comp = nil;
 
-    g_arenas = nil; g_sub_arenas = nil; g_cur_arena = nil;
+    g_arenas = nil; g_sub_arenas = nil; g_cur_arena = nil; g_fxt_sub_arenas = nil; g_fxt_arena = nil;
     g_sp_heaps = nil; g_gml_free = nil; g_gmem_buf = nil; g_seen_buf = nil;
     g_quad_ib = nil; g_fan_ib = nil;
     g_up_texs = nil; g_up_views = nil; g_up_keep = nil;

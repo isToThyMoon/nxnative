@@ -98,6 +98,10 @@ enum {
     RO_T_ADDR, RO_T_TEX, RO_T_SAMP,
     RO_LABEL, RO_R_TS, RO_C_TS,   // diagnostics: DM_NVN_ENC_LABEL, DM_NVN_GPUPROF
     RO_NOTE,   // a[0] an _Atomic uint64_t, a[1] a value: the encode thread has made every call before this one (rec_note_wait)
+    // DM_NVN_FA_THREAD (nvn_mtl.m fxt_exec): the encode thread places frame-ahead uniform blocks. RESET: a new submission; PEND: a write queued (a[0] address, a[1] bytes, a[2] kind;
+    // kind 255: a[0] = the bytes of the inline update queued last); SBW: a GPU write noted (a[0] address, a[1] bytes, 0 = anywhere); CBUF: a[0] the argument slot,
+    // a[1] address, a[2] bytes, a[3] the address in place, a[4] the replayed list, a[5] 0 or what the submit thread found (check)
+    RO_FX_RESET, RO_FX_PEND, RO_FX_SBW, RO_FX_CBUF,
 };
 typedef struct { uint32_t op, nobj; uint64_t a[15]; } rec_t;   // the first nobj slots hold retained objects (0 for nil), released once the call is made
 enum { REC_BLK = 256 };
@@ -136,6 +140,7 @@ static void rec_note_wait(_Atomic uint64_t *p, uint64_t v) {
 
 // ---------- The encode thread ----------
 static id g_rx_cb, g_rx_enc;   // the encode thread's real command buffer and open encoder
+static void fxt_exec(const uint32_t op, const uint64_t *a);   // nvn_mtl.m
 static void rec_exec(const rec_t *r) {
     const uint64_t *a = r->a; id e = g_rx_enc;
     switch (r->op) {
@@ -206,6 +211,7 @@ static void rec_exec(const rec_t *r) {
     case RO_R_TS: [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:a[1] afterStage:a[2] intoHeap:rec_id(a[0]) atIndex:a[3]]; break;
     case RO_C_TS: [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:a[1] intoHeap:rec_id(a[0]) atIndex:a[2]]; break;
     case RO_NOTE: { _Atomic uint64_t *p = (_Atomic uint64_t *)(uintptr_t)a[0]; pthread_mutex_lock(&g_note_mu); if (a[1] > atomic_load(p)) atomic_store(p, a[1]); pthread_cond_broadcast(&g_note_cv); pthread_mutex_unlock(&g_note_mu); break; }
+    case RO_FX_RESET: case RO_FX_PEND: case RO_FX_SBW: case RO_FX_CBUF: fxt_exec(r->op, a); break;
     default: MDIE("deferred encoding: unknown record %u", r->op);
     }
     for (uint32_t i = 0; i < r->nobj; i++) if (a[i]) CFRelease((CFTypeRef)(uintptr_t)a[i]);
