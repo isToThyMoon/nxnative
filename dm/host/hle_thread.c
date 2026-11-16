@@ -1036,6 +1036,36 @@ void dm_yield_top(char *out, size_t n) {
 }
 // CPU time of the guest threads since the last call, by Switch priority band (<= 44: the main thread's level and above; 45-59; >= 60) and the three busiest threads with their priority.
 // For the power line (hle_nvn.c power_line): it shows which threads a priority-to-QoS mapping would move and how much CPU they use. secs = the window length
+// Every thread of the process, guest or host, by the CPU time it took since the last call: the top ones by name with their share of it on performance cores unknown
+// here (the power line has that for the process). The host's own threads (replay, encode, Metal's submission queue, present, audio) are in no guest table, and on a
+// phone whose clock the system lowers by the power the whole process draws, each of them costs the replay thread time
+void dm_all_thread_cpu(char *out, size_t n, double secs) {
+    enum { N = 128, TOP = 10 };
+    static struct { uint64_t id, us; } prev[N]; static int nprev;
+    struct { uint64_t id, us, d; char name[40]; } cur[N]; int nc = 0;
+    thread_act_array_t ths; mach_msg_type_number_t nth = 0; out[0] = 0;
+    if (task_threads(mach_task_self(), &ths, &nth) != KERN_SUCCESS) return;
+    for (mach_msg_type_number_t i = 0; i < nth; i++) {
+        thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+        thread_identifier_info_data_t ii; mach_msg_type_number_t ic = THREAD_IDENTIFIER_INFO_COUNT;
+        thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT;
+        if (nc < N && thread_info(ths[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) == KERN_SUCCESS && thread_info(ths[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ii, &ic) == KERN_SUCCESS) {
+            cur[nc].id = ii.thread_id; cur[nc].us = (uint64_t)(bi.user_time.seconds + bi.system_time.seconds) * 1000000ull + (uint64_t)(bi.user_time.microseconds + bi.system_time.microseconds);
+            cur[nc].name[0] = 0; if (thread_info(ths[i], THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc) == KERN_SUCCESS) strlcpy(cur[nc].name, xi.pth_name, sizeof cur[nc].name);
+            if (!cur[nc].name[0]) snprintf(cur[nc].name, sizeof cur[nc].name, "%#llx", (unsigned long long)ii.thread_id);
+            cur[nc].d = cur[nc].us; for (int k = 0; k < nprev; k++) if (prev[k].id == cur[nc].id) { cur[nc].d = cur[nc].us - prev[k].us; break; }
+            nc++; }
+        mach_port_deallocate(mach_task_self(), ths[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)ths, nth * sizeof *ths);
+    uint64_t sum = 0; for (int i = 0; i < nc; i++) sum += cur[i].d;
+    nprev = nc; for (int i = 0; i < nc; i++) { prev[i].id = cur[i].id; prev[i].us = cur[i].us; }
+    if (secs <= 0) return;
+    int p = snprintf(out, n, "%d threads %.0f ms/s:", nc, sum / 1000.0 / secs);
+    for (int t = 0; t < TOP && p < (int)n - 60; t++) { int b = -1; for (int i = 0; i < nc; i++) if (cur[i].d && (b < 0 || cur[i].d > cur[b].d)) b = i;
+        if (b < 0) break;
+        p += snprintf(out + p, n - p, " '%s' %.0f,", cur[b].name, cur[b].d / 1000.0 / secs); cur[b].d = 0; }
+}
 void dm_thread_cpu(char *out, size_t n, double secs) {
     thr_t *top[3] = {0}; double d[3] = {0}, band[3] = {0};
     pthread_mutex_lock(&G);
