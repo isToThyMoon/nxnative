@@ -14,3 +14,5 @@ __attribute__((weak)) void dm_teardown_check_current_thread(void) {}
 
 #include <pthread/qos.h>
 __attribute__((weak)) qos_class_t dm_host_qos(void) { return QOS_CLASS_USER_INTERACTIVE; }   // hle_thread.c (DM_HOST_QOS): the encode, copy and replay threads ask for it
+__attribute__((weak)) void dm_all_thread_cpu(char *out, size_t n, double secs) { (void)secs; if (n) out[0] = 0; }   // hle_thread.c: the "all threads" line
+__attribute__((weak)) void dm_thread_prof_start(void) {}   // hle_thread.c (DM_THREAD_PROF)

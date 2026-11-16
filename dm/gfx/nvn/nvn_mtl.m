@@ -1958,13 +1958,21 @@ static inline unsigned gw_slot(uint64_t pg) { return (unsigned)((pg * 0x9E3779B9
 // pass ended for each. The same range comes back every submission, so few are live at a time; only when none of the slots is free does it still count as a write anywhere
 enum { GWW_N = 32 };
 static struct { uint64_t lo, hi, fence; } g_gww[GWW_N];
+static uint64_t g_gww_max;   // the highest fence put into g_gww: none of its ranges is running once that has completed
 static void gww_put(uint64_t lo, uint64_t hi, uint64_t fence, uint64_t done) {
     int free_slot = -1;
-    for (int i = 0; i < GWW_N; i++) { if (g_gww[i].lo == lo && g_gww[i].hi == hi) { if (fence > g_gww[i].fence) g_gww[i].fence = fence; return; } if (free_slot < 0 && g_gww[i].fence <= done) free_slot = i; }
+    for (int i = 0; i < GWW_N; i++) { if (g_gww[i].lo == lo && g_gww[i].hi == hi) { if (fence > g_gww[i].fence) g_gww[i].fence = fence; if (fence > g_gww_max) g_gww_max = fence; return; } if (free_slot < 0 && g_gww[i].fence <= done) free_slot = i; }
+    if (fence > g_gww_max) g_gww_max = fence;
     if (free_slot >= 0) { g_gww[free_slot].lo = lo; g_gww[free_slot].hi = hi; g_gww[free_slot].fence = fence; }
     else if (fence > g_gw_all) g_gw_all = fence;
 }
+// The highest fence of the writes put under a page's filter slot, per table: a look at a page no running write is near stops here. The tables are 1.5 MB each and a
+// uniform block's page is in none of them most of the time; on an iPhone the three looks per placed block were a quarter of the encode thread's time (DM_THREAD_PROF)
+enum { GWF_N = 4096 };
+static uint64_t g_gwf[3][GWF_N];
+static inline uint64_t *gwf_slot(const gw_ent *t, uint64_t pg);
 static void gw_put_cells(gw_ent *t, uint64_t pg, uint64_t cells, uint64_t fence, uint64_t done) {
+    { uint64_t *f = gwf_slot(t, pg); if (fence > *f) *f = fence; }
     unsigned s = gw_slot(pg); int fin = t[s].fence <= done;
     if (t[s].page == pg) { if (fin) t[s].cells = 0; }   // what was written there has finished
     else if (fin) { t[s].page = pg; t[s].cells = 0; }
@@ -1981,8 +1989,9 @@ static void gw_put(uint64_t lo, uint64_t hi, uint64_t fence, uint64_t done) { gw
 static int gw_live_in(const gw_ent *t, uint64_t lo, uint64_t hi) {
     uint64_t done = g_done;   // read without the lock as elsewhere: a stale value only refuses more
     if (g_gw_all > done) return 1;
-    for (int i = 0; i < GWW_N; i++) if (g_gww[i].fence > done && lo < g_gww[i].hi && g_gww[i].lo < hi) return 1;
-    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { unsigned s = gw_slot(pg); if ((t[s].page == pg || t[s].page == ~0ull) && t[s].fence > done && (t[s].cells & cell_mask(lo, hi, pg))) return 1; }
+    if (g_gww_max > done) for (int i = 0; i < GWW_N; i++) if (g_gww[i].fence > done && lo < g_gww[i].hi && g_gww[i].lo < hi) return 1;
+    for (uint64_t pg = lo >> 12; pg <= (hi - 1) >> 12; pg++) { if (*gwf_slot(t, pg) <= done) continue;   // nothing running was put near this page
+        unsigned s = gw_slot(pg); if ((t[s].page == pg || t[s].page == ~0ull) && t[s].fence > done && (t[s].cells & cell_mask(lo, hi, pg))) return 1; }
     return 0;
 }
 // The records the host writes into guest memory when a submission completes (post_run): counter reports and samples-passed results, 16 bytes each. Until then memory holds what was there
@@ -1994,6 +2003,7 @@ static int gw_live_in(const gw_ent *t, uint64_t lo, uint64_t hi) {
 enum { HW_N = 4096 };
 static struct { uint64_t lo, fence; } g_hwr[HW_N]; static uint64_t g_nhwr;   // fences grow along the ring
 static gw_ent g_gwr[GW_N];   // the pages of the records in the ring
+static inline uint64_t *gwf_slot(const gw_ent *t, uint64_t pg) { return &g_gwf[t == g_gw ? 0 : t == g_gwx ? 1 : 2][(pg ^ (pg >> 12)) & (GWF_N - 1)]; }
 static int hw_exact_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_REPORT_EXACT"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_REPORT_EXACT=0: a counter report of a running submission refuses uniform shadows over its whole page"); } return v; }
 static void hw_note(uint64_t addr) {
     if (g_nhw_sub == g_hw_cap) { int c = g_hw_cap ? g_hw_cap * 2 : 256; uint64_t *p = realloc(g_hw_sub, (size_t)c * sizeof *p); if (!p) { g_sbw_over = 1; return; } g_hw_sub = p; g_hw_cap = c; }   // over: every page counts as written (gw_commit)
@@ -3077,7 +3087,7 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
 // Host record of a packaged texture: the current MTLTexture, the upload stamp, and the global write generation at the last check
 // spare: the texture the last re-upload replaced, kept resident and written by the next re-upload once the GPU has passed spare_fence (a texture the CPU rewrites every frame, a movie frame,
 // alternates between two textures instead of allocating one per frame: Link's Awakening's title movie made and freed an 8 MB texture a frame)
-@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen, sub, own, lost_gen; const void *span; int sparse, vbase, part; uint8_t *edge[2]; uint32_t edge_n[2], stored; id ps; id<MTLBuffer> eb; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
+@interface NvPkg : NSObject { @public id<MTLTexture> tex, spare, view; uint64_t stamp, seen, hash, spare_fence, vgen, vseen, sub, own, lost_gen; const void *span; int sparse, vbase, part; uint8_t *edge[2]; uint32_t edge_hot; uint64_t edge_sub; uint32_t edge_n[2], stored; id ps; id<MTLBuffer> eb; } @end   // hash: full hash of the uploaded content under DM_NVN_DIRTYCHECK; span: its tracked range (nvn_dirty_span, NULL = untracked);
 // sparse: in a sparse virtual pool, read through its page table (hle_nvn.c nvn_sparse_*), vgen the page table's generation at the upload and vseen at the last look; view: what it is bound as (sparse_view)
 // ps: its placement sparse texture (NvSparse, sparse_make), which tex is: mapped and uploaded tile by tile (sparse_sync)
 // edge: the uploaded bytes of the storage's first and last host pages where other data shares them (pkg_edges_take); in eb from the first GPU store into its storage on (pkg_edges_gpu),
@@ -3166,13 +3176,21 @@ static int pkg_inner_written(const NvPkg *pk, const tex_t *t) {   // a page whol
     uintptr_t r[2][2], ia, ie; pkg_edge_ranges(t, r, &ia, &ie);
     return ie > ia && nvn_dirty_since_span(pk->span, (const void *)ia, ie - ia, pk->stamp);
 }
+enum { PKG_HOT = 16 }; static uint64_t g_pkg_hot_skips, g_pkg_hot_looks;
+static int pkg_hot_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_PKG_HOT"); v = !(e && !strcmp(e, "0")); } return v; }
 static int pkg_edges_clean(NvPkg *pk, const tex_t *t) {   // the covered pages were written since the upload: 1 = only edge pages, and the texture's bytes there are as uploaded
     if (!pk->edge_n[0] && !pk->edge_n[1]) return 0;
     uintptr_t r[2][2], ia, ie; pkg_edge_ranges(t, r, &ia, &ie);
-    uint64_t st = nvn_dirty_now(); nvn_dirty_protect(t->mem, t->L.size);   // take the stamp, protect, then read (as pkg_upload): a later write is seen at the next check
+    // A texture whose shared pages a neighbour writes every frame (Breath of the Wild: about 23 a frame) was protected again here each time, faulted on the neighbour's next
+    // write and came back: on an iPhone the mprotect calls alone were 5% of the submit thread, beside a fault on a game thread each. After PKG_HOT such rounds its shared
+    // pages stay open and its bytes there are compared once a submission instead (tex_mtl: edge_sub); the pages wholly inside it stay protected. DM_NVN_PKG_HOT=0: as before
+    int hot = pk->edge_hot >= PKG_HOT && pkg_hot_on();
+    uint64_t st = nvn_dirty_now();   // take the stamp, protect, then read (as pkg_upload): a later write is seen at the next check
+    if (!hot) nvn_dirty_protect(t->mem, t->L.size); else if (ie > ia) nvn_dirty_protect((const void *)ia, ie - ia);
     if (ie > ia && nvn_dirty_since_span(pk->span, (const void *)ia, ie - ia, pk->stamp)) return 0;
     for (int i = 0; i < 2; i++) if (pk->edge_n[i] && memcmp(pk->edge[i], (const void *)r[i][0], pk->edge_n[i])) return 0;
-    pk->stamp = st; g_pkg_edge_skips++;
+    pk->stamp = st; g_pkg_edge_skips++; if (pk->edge_hot < PKG_HOT) pk->edge_hot++; else g_pkg_hot_skips++;
+    pk->edge_sub = g_sub_serial;
     return 1;
 }
 // Usage an NVN image takes: shader writes, and for R32Uint / R32Sint the shader-atomic usage too, since Metal runs texture atomics only on such textures (dummy_img_atomic) and NVN does
@@ -4848,8 +4866,13 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
             // found a few pages written took a texture and uploaded, the writer wrote a few more meanwhile, and the next draw's look found those (Ocarina of Time, 22 uploads of
             // one texture in one submission, docs/reference/frame-rate.md). A write by this thread is in order with the commands it replays and is looked for (own); outside a
             // submission (a present) every look reads the pages
-            int written = !tracked || (now != pk->seen && nvn_dirty_since_span(pk->span, t->mem, t->L.size, pk->stamp));
-            int kept = written && tracked && !pk->sparse && atomic_load_explicit(&g_sub_on, memory_order_relaxed) && pk->sub == g_sub_serial && pk->own == own;
+            // Its shared pages are left open (pkg_edges_clean): no fault tells of a write to its bytes there, so they are compared at its first look of each submission
+            int edge_moved = 0;
+            if (pk->edge_hot >= PKG_HOT && tracked && !pk->sparse && (pk->edge_sub != g_sub_serial || !atomic_load_explicit(&g_sub_on, memory_order_relaxed)) && pkg_hot_on()) {
+                uintptr_t r[2][2], ia, ie; pkg_edge_ranges(t, r, &ia, &ie); pk->edge_sub = g_sub_serial; g_pkg_hot_looks++;
+                for (int i = 0; i < 2; i++) if (pk->edge_n[i] && memcmp(pk->edge[i], (const void *)r[i][0], pk->edge_n[i])) edge_moved = 1; }
+            int written = !tracked || edge_moved || (now != pk->seen && nvn_dirty_since_span(pk->span, t->mem, t->L.size, pk->stamp));
+            int kept = written && !edge_moved && tracked && !pk->sparse && atomic_load_explicit(&g_sub_on, memory_order_relaxed) && pk->sub == g_sub_serial && pk->own == own;
             int clean = !written || kept;
             // Only the pages it shares with other data, its bytes there as uploaded: clean, and no write generation started for a neighbour's writes (pkg_edges_clean protects
             // the storage again, so not while a page inside it is being written)
@@ -7599,7 +7622,15 @@ static int bind_vbufs(id<MTL4RenderCommandEncoder> en, const nvn_refl *rf) {
             }
             cache[s].addr = addr; cache[s].gpu = gpu; cache[s].gen = gen;
         }
-        if (fa_on() && S.vbuf[s].size && S.vbuf[s].size <= FA_COPY_MAX_FWD) { __strong id<MTLBuffer> fb = nil; g_fa_kind = 1; gpu = fa_cbuf(addr, S.vbuf[s].size, gpu, &fb); g_fa_kind = 0; }   // frame ahead: a stream on volatile pages is read from a copy
+        if (fa_on() && S.vbuf[s].size && S.vbuf[s].size <= FA_COPY_MAX_FWD) {   // frame ahead: a stream on volatile pages is read from a copy
+            // The stream's answer of the last draw holds while the commit, the replayed list and the queued writes are the same (as an argument block's slots, encode_args_):
+            // most draws bind the streams of the draw before, and on an iPhone asking fa_cbuf for each of them again was a tenth of the submit thread (DM_NVN_VBUF_MEMO=0)
+            static struct { uint64_t addr, size, ep, fence, base, res; int npend; uint32_t pgen; } fm[16]; static int memo = -1;
+            if (memo < 0) { const char *e = getenv("DM_NVN_VBUF_MEMO"); memo = !(e && !strcmp(e, "0")); }
+            uint64_t fn = atomic_load_explicit(&g_fence, memory_order_relaxed);
+            if (memo && fm[s].addr == addr && fm[s].size == S.vbuf[s].size && fm[s].base == gpu && fm[s].ep == g_fa_epoch && fm[s].fence == fn && fm[s].npend == g_npend && fm[s].pgen == g_pend_gen) gpu = fm[s].res;
+            else { __strong id<MTLBuffer> fb = nil; uint64_t base = gpu; g_fa_kind = 1; gpu = fa_cbuf(addr, S.vbuf[s].size, gpu, &fb); g_fa_kind = 0;
+                fm[s].addr = addr; fm[s].size = S.vbuf[s].size; fm[s].base = base; fm[s].res = gpu; fm[s].ep = g_fa_epoch; fm[s].fence = fn; fm[s].npend = g_npend; fm[s].pgen = g_pend_gen; } }
         enc_r_vbuf(en, VB_SLOT(s), gpu);
     }
     static id<MTLBuffer> zero; static uint64_t zero_gpu;
