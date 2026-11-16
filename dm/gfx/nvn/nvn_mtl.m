@@ -11406,7 +11406,8 @@ static uint64_t ub_padded(NvShader *sh, int st, int reg, const p_bind_buf *u, ui
 // - a uniform block on a volatile page is copied into the submission's arena when it is bound (fa_cbuf) and the draw reads the copy, so the page needs no protection;
 // - what the host cannot place yet (a binding that reaches any pool, a compute stage's buffers) sets g_fa_block: the wait then covers that submission as before.
 // A wrong guess costs a wait, never a wrong picture. "[ahead]" lines every 600 frames give the counts. DM_FRAME_AHEAD=ab alternates with the DM_AB phases
-typedef struct { _Atomic uint64_t page, fence; _Atomic uint32_t frame; _Atomic uint8_t vol, prot, kind; } fa_pg;   // kind: what read it in place last (FA_K_*)
+typedef struct { _Atomic uint64_t page, fence; _Atomic uint32_t frame, vol_frame; _Atomic uint8_t vol, prot, kind, vol_n; } fa_pg;   // vol_frame, vol_n: when it was last marked volatile and how often (fa_vol)
+//   // kind: what read it in place last (FA_K_*)
 enum { FA_K_UNI, FA_K_VTX, FA_K_IDX, FA_K_PTR, FA_K_GPUW, FA_K_N };
 static int g_fa_kind;   // the kind of the binding being placed (the submit thread)
 static int g_fa_force;   // set around a call: copy the block whether its pages are volatile or not (a compute stage's inputs)
@@ -11443,6 +11444,21 @@ static int fa_gmem(int nvn_stage) {
     if (u->size < (uint64_t)g_fa_gm_bytes) fa_bind(u->addr, u->addr + (uint64_t)g_fa_gm_bytes);   // the part past the binding is reached through the table, in place
     return 0;
 }
+// Whether a page still counts as volatile. A page was volatile for good once a write met it in flight, and a pool the game streams new models into is written once and
+// then static again: one area load on an iPhone marked 3,450 pages of vertex data, and from then on every stream on them was copied at every draw group (2.3 MB a frame
+// against 1.1, a tenth of the submit thread in memmove), for the rest of the session. Now the mark runs out: 64 frames after the first time, twice as long after each
+// further one (up to 16,384), plus up to 252 frames by the page so that a burst does not come back in one frame. The page is then read in place and protected again; a
+// write to it marks it again at the cost of one fault, so a page written every frame is asked ever more rarely. DM_FRAME_AHEAD_VOL_AGE=0: volatile for good
+static uint64_t g_fa_unvol;
+static int fa_vol_age_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAME_AHEAD_VOL_AGE"); v = !(e && !strcmp(e, "0")); } return v; }
+static inline int fa_vol(fa_pg *e, uint64_t pg) {
+    if (!atomic_load_explicit(&e->vol, memory_order_relaxed)) return 0;
+    uint32_t n = atomic_load_explicit(&e->vol_n, memory_order_relaxed), age = (uint32_t)atomic_load_explicit(&g_cur_frame, memory_order_relaxed) - atomic_load_explicit(&e->vol_frame, memory_order_relaxed);
+    uint32_t keep = (64u << (n > 9 ? 8 : n ? n - 1 : 0)) + (uint32_t)((pg * 0x9E3779B97F4A7C15ull) >> 58) * 4;
+    if (age <= keep || !fa_vol_age_on()) return 1;
+    if (atomic_exchange(&e->vol, 0)) { atomic_fetch_sub(&g_fa_vol_n, 1); g_fa_unvol++; }
+    return 0;
+}
 static fa_pg *fa_find(uint64_t pg, int make) {
     unsigned h = (unsigned)((pg * 0x9E3779B97F4A7C15ull) >> 46) & (FA_PG - 1);
     for (int i = 0; i < 32; i++, h = (h + 1) & (FA_PG - 1)) {
@@ -11462,7 +11478,8 @@ static void fa_gate(uintptr_t lo, uintptr_t hi) {
     for (uint64_t pg = (uint64_t)lo >> 14; pg <= ((uint64_t)hi - 1) >> 14; pg++) {
         fa_pg *e = fa_find(pg, 0); if (!e) continue;
         atomic_store(&e->prot, 0);
-        if (!atomic_exchange(&e->vol, 1)) atomic_fetch_add(&g_fa_vol_n, 1);
+        atomic_store_explicit(&e->vol_frame, cur, memory_order_relaxed);
+        if (!atomic_exchange(&e->vol, 1)) { atomic_fetch_add(&g_fa_vol_n, 1); uint8_t k = atomic_load_explicit(&e->vol_n, memory_order_relaxed); if (k < 255) atomic_store_explicit(&e->vol_n, (uint8_t)(k + 1), memory_order_relaxed); }
         uint64_t f = atomic_load(&e->fence);
         // The submit thread's own writes (an inline update landing) keep their order with the frame being replayed, as before; they wait only for an earlier frame's readers.
         // A fence not committed yet is the frame in replay: nothing to wait for
@@ -11519,7 +11536,7 @@ static uint64_t fa_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, __strong id<MT
         if (ded[k].state == 2) { *use = (__bridge id<MTLBuffer>)ded[k].buf; return ded[k].gpu; } }
     ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = g_fa_epoch; ded[k].fence = fn; ded[k].npend = g_npend; ded[k].pgen = g_pend_gen; ded[k].state = 1; ded[k].gpu = 0; ded[k].buf = NULL;
     int vol = 0;
-    for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && atomic_load_explicit(&e->vol, memory_order_relaxed)) { vol = 1; break; } }
+    for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && fa_vol(e, pg)) { vol = 1; break; } }
     if (!vol && !g_fa_force) { fa_bind(addr, addr + ul); return gpu; }
     // The block as the GPU will read it at this point: memory, with the inline updates of submissions still running and of this one laid over it (ubp_get: the host has
     // their bytes, the game's memory gets them only when their blit has run). So a block the game updates inline every frame is copied too, and its page needs no
@@ -11663,7 +11680,7 @@ static uint64_t fxt_cbuf(uint64_t addr, uint64_t ul, uint64_t gpu, uint64_t ep, 
         if (ded[k].state == 2) { *cpu = ded[k].cpu; return ded[k].gpu; } }
     ded[k].addr = addr; ded[k].ul = ul; ded[k].ep = ep; ded[k].fence = fn; ded[k].npend = g_fxt_np; ded[k].pgen = g_fxt_gen; ded[k].state = 1; ded[k].gpu = 0; ded[k].cpu = NULL;
     int vol = 0;
-    for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && atomic_load_explicit(&e->vol, memory_order_relaxed)) { vol = 1; break; } }
+    for (uint64_t pg = addr >> 14; pg <= (addr + ul - 1) >> 14; pg++) { fa_pg *e = fa_find(pg, 0); if (e && fa_vol(e, pg)) { vol = 1; break; } }
     if (!vol) { fa_bind_in(addr, addr + ul, bound, FA_K_UNI); return gpu; }
     { uint64_t g; uint8_t *c;
       if (fxt_ubp(addr, addr + ul, &g, &c)) { if (count) { g_fxt_snap_n++; g_fxt_snap_bytes += ul; } ded[k].gpu = g; ded[k].cpu = c; ded[k].state = 2; *cpu = c; return g; } }
@@ -11724,9 +11741,9 @@ static void fa_frame(uint64_t f) {   // the submit thread, when the frame it rep
     { static double ema; static uint64_t seen; for (uint64_t k = f > 2 ? f - 2 : 0; k > seen && k + 12 > f; k--) { double g = mtl_gpu_ms(k); if (g > 0) { ema = ema > 0 ? ema + 0.1 * (g - ema) : g; seen = k; atomic_store_explicit(&g_fa_gpu_us, (uint32_t)(ema * 1000), memory_order_relaxed); break; } } }
     static uint64_t p[12]; uint64_t v[12] = {g_fa_inplace_vol + g_fxt_inplace_vol, atomic_load(&g_fa_ahead_n), atomic_load(&g_fa_real_n), g_fa_snap_n + g_fxt_snap_n, g_fa_snap_bytes + g_fxt_snap_bytes, g_fa_binds, g_fa_prot, atomic_load(&g_fa_gate_n), atomic_load(&g_fa_gate_ns), g_fa_blocks, atomic_load(&g_fa_gate_late), atomic_load(&g_fa_skip)};
     if (f && !(f % 600)) { double n = 600.0;
-        MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB), on volatile pages but read in place for a GPU write still to come %.1f; ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); by what read the page in place: uniform %llu, vertex %llu, index %llu, pointer or storage %llu, a block with a GPU write to come %llu (totals); submissions the wait must cover %.2f (reports that hold it so far %llu; samples-passed reports and small texture readbacks, which do not, %llu); acquires that skipped the display tick %.2f; volatile pages %llu; table full %llu, gate timeouts %llu",
+        MLOG("[ahead] up to frame %llu, per frame: newest-fence waits answered ahead %.2f, in full %.2f; uniform blocks copied %.1f (%.1f KB), on volatile pages but read in place for a GPU write still to come %.1f; ranges read in place %.0f, protected again %.1f; writes that waited for the GPU %.2f (%.3f ms); by what read the page in place: uniform %llu, vertex %llu, index %llu, pointer or storage %llu, a block with a GPU write to come %llu (totals); submissions the wait must cover %.2f (reports that hold it so far %llu; samples-passed reports and small texture readbacks, which do not, %llu); acquires that skipped the display tick %.2f; volatile pages %llu (%llu marks run out so far); table full %llu, gate timeouts %llu",
              (unsigned long long)f, (v[1] - p[1]) / n, (v[2] - p[2]) / n, (v[3] - p[3]) / n, (v[4] - p[4]) / n / 1024.0, (v[0] - p[0]) / n, (v[5] - p[5]) / n, (v[6] - p[6]) / n, (v[7] - p[7]) / n, (v[8] - p[8]) / n / 1e6, (unsigned long long)atomic_load(&g_fa_gate_k[0]), (unsigned long long)atomic_load(&g_fa_gate_k[1]), (unsigned long long)atomic_load(&g_fa_gate_k[2]), (unsigned long long)atomic_load(&g_fa_gate_k[3]), (unsigned long long)atomic_load(&g_fa_gate_k[4]), (v[9] - p[9]) / n, (unsigned long long)g_fa_readbacks, (unsigned long long)g_fa_small_rb, (v[11] - p[11]) / n,
-             (unsigned long long)atomic_load(&g_fa_vol_n), (unsigned long long)g_fa_full, (unsigned long long)(v[10] - p[10]));
+             (unsigned long long)atomic_load(&g_fa_vol_n), (unsigned long long)g_fa_unvol, (unsigned long long)g_fa_full, (unsigned long long)(v[10] - p[10]));
         { static uint64_t w0[6]; uint64_t w[6]; mtl_ubp_why(w);
           MLOG("[ahead] copies refused since the last line (the block is then read in place): too large or shadows off %llu, a shader's store to come %llu, a copy or fill of a running submission %llu, a copy or fill of this submission %llu, unreadable %llu, a report to land %llu; storage writes answered by a wide write %llu (the last %llu bytes wide), by a cell %llu, write set full now %d",
                (unsigned long long)(w[0] - w0[0]), (unsigned long long)(w[1] - w0[1]), (unsigned long long)(w[2] - w0[2]), (unsigned long long)(w[3] - w0[3]), (unsigned long long)(w[4] - w0[4]), (unsigned long long)(w[5] - w0[5]), (unsigned long long)g_sbw_hit_wide, (unsigned long long)g_sbw_wide_bytes, (unsigned long long)g_sbw_hit_cell, g_sbw_over); memcpy(w0, w, sizeof w0); g_sbw_hit_wide = g_sbw_hit_cell = 0; }
