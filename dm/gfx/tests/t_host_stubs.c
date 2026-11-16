@@ -11,3 +11,6 @@ __attribute__((weak)) int dm_teardown_is_parking(void) { return 0; }
 __attribute__((weak)) void dm_teardown_check_current_thread(void) {}
 // The runtime profile the NVN layer reads (dm_profile in hle_profile.c): no DM_PROFILE in a test, so these are the compiled game_profile.h values
 #include "../../host/hle_profile.c"
+
+#include <pthread/qos.h>
+__attribute__((weak)) qos_class_t dm_host_qos(void) { return QOS_CLASS_USER_INTERACTIVE; }   // hle_thread.c (DM_HOST_QOS): the encode, copy and replay threads ask for it
