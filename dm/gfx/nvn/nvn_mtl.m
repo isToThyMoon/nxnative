@@ -11450,12 +11450,15 @@ static int fa_gmem(int nvn_stage) {
 // further one (up to 16,384), plus up to 252 frames by the page so that a burst does not come back in one frame. The page is then read in place and protected again; a
 // write to it marks it again at the cost of one fault, so a page written every frame is asked ever more rarely. DM_FRAME_AHEAD_VOL_AGE=0: volatile for good
 static uint64_t g_fa_unvol;
-static int fa_vol_age_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAME_AHEAD_VOL_AGE"); v = !(e && !strcmp(e, "0")); } return v; }
+// The first mark's length in frames (DM_FRAME_AHEAD_VOL_AGE, 0 = for good). 512: with 64 a far model flickered for a frame once in 7.6 minutes on an iPhone, as a page
+// read in place again can when the game writes it in flight; a load is over within seconds either way
+static int fa_vol_age_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAME_AHEAD_VOL_AGE"); v = e ? atoi(e) : 512; if (v < 0) v = 0; if (v > 16384) v = 16384; } return v; }
 static inline int fa_vol(fa_pg *e, uint64_t pg) {
     if (!atomic_load_explicit(&e->vol, memory_order_relaxed)) return 0;
     uint32_t n = atomic_load_explicit(&e->vol_n, memory_order_relaxed), age = (uint32_t)atomic_load_explicit(&g_cur_frame, memory_order_relaxed) - atomic_load_explicit(&e->vol_frame, memory_order_relaxed);
-    uint32_t keep = (64u << (n > 9 ? 8 : n ? n - 1 : 0)) + (uint32_t)((pg * 0x9E3779B97F4A7C15ull) >> 58) * 4;
-    if (age <= keep || !fa_vol_age_on()) return 1;
+    uint32_t base = (uint32_t)fa_vol_age_on(); if (!base) return 1;
+    uint64_t keep = ((uint64_t)base << (n > 6 ? 5 : n ? n - 1 : 0)) + (uint32_t)((pg * 0x9E3779B97F4A7C15ull) >> 58) * 4;   // up to 32 times the first length
+    if (age <= keep) return 1;
     if (atomic_exchange(&e->vol, 0)) { atomic_fetch_sub(&g_fa_vol_n, 1); g_fa_unvol++; }
     return 0;
 }
