@@ -1066,6 +1066,83 @@ void dm_all_thread_cpu(char *out, size_t n, double secs) {
         if (b < 0) break;
         p += snprintf(out + p, n - p, " '%s' %.0f,", cur[b].name, cur[b].d / 1000.0 / secs); cur[b].d = 0; }
 }
+// DM_THREAD_PROF=<samples a second>: a sampling profile of the process's busiest threads on the device itself (an iPhone has no `sample`). Every second the eight
+// threads that took the most CPU are chosen; at each tick a chosen thread that is running is suspended, its frame chain read (10 frames) and resumed. Every 20 s the
+// stacks seen most go to the log as "[prof] '<thread>' <samples>: leaf < caller < ...", symbols by dladdr. Nothing is allocated or logged while a thread is suspended
+static void *tprof_main(void *arg) {
+    int hz = (int)(intptr_t)arg; pthread_setname_np("dm-thread-prof");
+    enum { MAXT = 8, D = 10, HN = 1 << 14, NP = 160 };
+    typedef struct { uint64_t pc[D]; uint32_t n; char name[28]; } ent;
+    ent *h = calloc(HN, sizeof *h); if (!h) return NULL;
+    static struct { uint64_t id, us; } prev[NP]; int nprev = 0;
+    thread_act_t tg[MAXT]; char tn[MAXT][28]; int ntg = 0; uint64_t total = 0, lost = 0;
+    thread_act_t self = mach_thread_self();
+    for (uint64_t tick = 0;; tick++) {
+        if (tick % (uint64_t)hz == 0) {   // choose the targets again
+            for (int i = 0; i < ntg; i++) mach_port_deallocate(mach_task_self(), tg[i]);
+            ntg = 0;
+            thread_act_array_t ths; mach_msg_type_number_t nth = 0;
+            if (task_threads(mach_task_self(), &ths, &nth) == KERN_SUCCESS) {
+                struct { uint64_t id, us, d; } cur[NP]; int nc = 0; int idx[NP];
+                for (mach_msg_type_number_t i = 0; i < nth && nc < NP; i++) {
+                    thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT; thread_identifier_info_data_t ii; mach_msg_type_number_t ic = THREAD_IDENTIFIER_INFO_COUNT;
+                    if (ths[i] == self || thread_info(ths[i], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS || thread_info(ths[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ii, &ic) != KERN_SUCCESS) continue;
+                    cur[nc].id = ii.thread_id; cur[nc].us = (uint64_t)(bi.user_time.seconds + bi.system_time.seconds) * 1000000ull + (uint64_t)(bi.user_time.microseconds + bi.system_time.microseconds);
+                    cur[nc].d = 0; for (int k = 0; k < nprev; k++) if (prev[k].id == cur[nc].id) { cur[nc].d = cur[nc].us - prev[k].us; break; }
+                    idx[nc++] = (int)i; }
+                for (int t = 0; t < MAXT; t++) { int b = -1; for (int i = 0; i < nc; i++) if (cur[i].d && (b < 0 || cur[i].d > cur[b].d)) b = i;
+                    if (b < 0) break;
+                    thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT; tn[ntg][0] = 0;
+                    if (thread_info(ths[idx[b]], THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc) == KERN_SUCCESS) strlcpy(tn[ntg], xi.pth_name, sizeof tn[ntg]);
+                    if (!tn[ntg][0]) snprintf(tn[ntg], sizeof tn[ntg], "%#llx", (unsigned long long)cur[b].id);
+                    mach_port_mod_refs(mach_task_self(), ths[idx[b]], MACH_PORT_RIGHT_SEND, 1); tg[ntg++] = ths[idx[b]]; cur[b].d = 0; }
+                nprev = nc; for (int i = 0; i < nc; i++) { prev[i].id = cur[i].id; prev[i].us = cur[i].us; }
+                for (mach_msg_type_number_t i = 0; i < nth; i++) mach_port_deallocate(mach_task_self(), ths[i]);
+                vm_deallocate(mach_task_self(), (vm_address_t)ths, nth * sizeof *ths);
+            }
+        }
+        for (int t = 0; t < ntg; t++) {
+            thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(tg[t], THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS || bi.run_state != TH_STATE_RUNNING) continue;
+            uint64_t pc[D] = {0}; int np = 0;
+            if (thread_suspend(tg[t]) != KERN_SUCCESS) continue;
+            arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(tg[t], ARM_THREAD_STATE64, (thread_state_t)&st, &n) == KERN_SUCCESS) {
+                uint64_t fp = __darwin_arm_thread_state64_get_fp(st); pc[np++] = __darwin_arm_thread_state64_get_pc(st) & 0x7fffffffffull;
+                while (np < D) { uint64_t fr[2]; vm_size_t g2 = 0;
+                    if (!fp || (fp & 7) || vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g2) || g2 != 16 || fr[0] <= fp) break;
+                    fp = fr[0]; pc[np++] = fr[1] & 0x7fffffffffull; } }
+            thread_resume(tg[t]);
+            if (!np) continue;
+            uint64_t k = (uint64_t)t * 0x9E3779B97F4A7C15ull; for (int i = 0; i < D; i++) k = (k ^ pc[i]) * 0x100000001B3ull;
+            unsigned s0 = (unsigned)(k >> 40) & (HN - 1); int put = 0; total++;
+            for (int i = 0; i < 32 && !put; i++) { ent *e = &h[(s0 + i) & (HN - 1)];
+                if (!e->n) { memcpy(e->pc, pc, sizeof pc); strlcpy(e->name, tn[t], sizeof e->name); e->n = 1; put = 1; }
+                else if (!memcmp(e->pc, pc, sizeof pc) && !strcmp(e->name, tn[t])) { e->n++; put = 1; } }
+            if (!put) lost++;
+        }
+        usleep(1000000 / hz);
+        if (tick % (uint64_t)(20 * hz) == (uint64_t)(20 * hz) - 1) {
+            dm_log("[prof] %llu samples of running threads in 20 s at %d Hz (%llu not kept)", (unsigned long long)total, hz, (unsigned long long)lost);
+            for (int r = 0; r < 220; r++) { int b = -1; for (int i = 0; i < HN; i++) if (h[i].n && (b < 0 || h[i].n > h[b].n)) b = i;
+                if (b < 0 || h[b].n < 2) break;
+                char line[900]; int p = snprintf(line, sizeof line, "[prof] '%s' %u:", h[b].name, h[b].n);
+                for (int i = 0; i < D && h[b].pc[i] && p < (int)sizeof line - 90; i++) { Dl_info di; memset(&di, 0, sizeof di); uint64_t a = h[b].pc[i] - (i ? 4 : 0);
+                    if (dladdr((void *)a, &di) && di.dli_sname) p += snprintf(line + p, sizeof line - p, "%s%.60s", i ? " < " : " ", di.dli_sname);
+                    else if (di.dli_fname) { const char *bn = strrchr(di.dli_fname, '/'); p += snprintf(line + p, sizeof line - p, "%s%.30s+%#llx", i ? " < " : " ", bn ? bn + 1 : di.dli_fname, (unsigned long long)(a - (uint64_t)di.dli_fbase)); }
+                    else p += snprintf(line + p, sizeof line - p, "%s%#llx", i ? " < " : " ", (unsigned long long)a); }
+                dm_log("%s", line); h[b].n = 0; }
+            memset(h, 0, HN * sizeof *h); total = lost = 0;
+        }
+    }
+    return NULL;
+}
+void dm_thread_prof_start(void) {
+    static int started; if (started) return; started = 1;
+    const char *e = getenv("DM_THREAD_PROF"); int hz = e ? atoi(e) : 0; if (hz <= 0) return;
+    if (hz > 2000) hz = 2000;
+    pthread_t th; if (!pthread_create(&th, NULL, tprof_main, (void *)(intptr_t)hz)) pthread_detach(th);
+}
 void dm_thread_cpu(char *out, size_t n, double secs) {
     thr_t *top[3] = {0}; double d[3] = {0}, band[3] = {0};
     pthread_mutex_lock(&G);

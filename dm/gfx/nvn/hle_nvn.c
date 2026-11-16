@@ -2031,7 +2031,7 @@ static void power_line(uint64_t frame) {
         char tc[400]; dm_thread_cpu(tc, sizeof tc, s);
         LOG("[nvn] threads up to frame %llu: CPU %s", frame, tc);
         { void dm_all_thread_cpu(char *, size_t, double); char ac[700]; dm_all_thread_cpu(ac, sizeof ac, s); LOG("[nvn] all threads up to frame %llu: %s", frame, ac); } }
-    else { char yt[192], rs[400], tc[400]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); { void dm_all_thread_cpu(char *, size_t, double); char ac[700]; dm_all_thread_cpu(ac, sizeof ac, 0); } }   // the first call only takes the baselines
+    else { char yt[192], rs[400], tc[400]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); { void dm_all_thread_cpu(char *, size_t, double); char ac[700]; dm_all_thread_cpu(ac, sizeof ac, 0); void dm_thread_prof_start(void); dm_thread_prof_start(); } }   // the first call only takes the baselines
     pt = t; pe = e; pcpu = cpu; pp = p; piw = iw; ppw = idw; pg = g; pf = frame; mtl_bw(&pld, &pst, &pfu); pudc = mtl_udc_saved_bytes();
 }
 static void tsummary(uint64_t frame) {
