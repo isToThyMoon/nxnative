@@ -14677,6 +14677,11 @@ static int csh_draw_reads(NvProg *pr, const p_draw *dw, const p_draw_idx *di, cs
 // A dispatch at its place in the stream (S as it is there): its storage buffers (counted as written), and whether it samples a colour attachment of the pass (1), only the depth (2)
 static uint64_t g_csh_split_ser, g_csh_split_fence, g_csh_stale;   // the depth attachment and submission of the last split a depth-sampling dispatch made; dispatches run on that depth
 static int csh_depth_split(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_CSH_DEPTH"); v = e && !strcmp(e, "split"); if (v) MLOG("DM_NVN_CSH_DEPTH=split: after a depth-sampling dispatch has split a pass, the later ones of the pass run ahead on the depth of that split"); } return v; }
+// Game barriers between the dispatches of a pass (Breath of the Wild's particle emitters: draw, dispatch, barrier bits 1, dispatch, draw …). The scan used to stop at one, so
+// of each emitter's two dispatches the second stayed in place and ended the pass: every attachment stored and loaded again per emitter (iPhone 17 Pro Max, five 1280x720
+// targets: 36.8 MB each, 1–3 a frame). A barrier orders earlier GPU writes before what follows; the dispatches moved ahead keep their own order, the draws passed write only
+// attachments, and attachments are what csh_cs checks, so the scan goes on past it. On with DM_NVN_CSH_DEPTH=split (0 off, 1 on without it)
+static int csh_barrier_pass(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_CSH_BARRIER"); v = e ? strcmp(e, "0") != 0 : csh_depth_split(); } return v; }
 static char g_csh_why[96];   // why csh_cs refused the last dispatch (logged once per shader)
 #define CSH_NO(...) do { snprintf(g_csh_why, sizeof g_csh_why, __VA_ARGS__); return 0; } while (0)
 static int csh_cs(NvShader *cs, const p_dispatch *dp, csh_rng *w, int *nw, int *depth) {
@@ -14709,7 +14714,7 @@ static int csh_dispatch_ahead(void) {
         if (!fz_next(&cur, &q, &hq, &aq)) return 0;
         switch (hq.op) {
             case OP_DISPATCH: return 1;
-            case OP_BARRIER: { uint32_t bits; memcpy(&bits, aq, sizeof bits); if (bits) return 0; continue; }
+            case OP_BARRIER: { uint32_t bits; memcpy(&bits, aq, sizeof bits); if (bits && !csh_barrier_pass()) return 0; continue; }
             case OP_DRAW: case OP_DRAW_IDX:
             case OP_ALPHA_REF: case OP_BIND_IMG: case OP_BIND_PROGRAM: case OP_BIND_SAMP: case OP_BIND_SSBO: case OP_BIND_STATE: case OP_BIND_TEX: case OP_BIND_TEX1:
             case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_VATTR: case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_VSTREAM: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
@@ -14734,7 +14739,7 @@ static void cs_hoist_try(NvProg *pr0, const p_draw *dw0, const p_draw_idx *di0) 
     for (int guard = 0; guard < 4096; guard++) {
         const uint8_t *q; op_hdr hq; const void *aq;
         if (!fz_next(&cur, &q, &hq, &aq)) break;
-        if (hq.op == OP_BARRIER) { uint32_t bits; memcpy(&bits, aq, sizeof bits); if (bits) { g_csh_stop[5]++; break; } continue; }
+        if (hq.op == OP_BARRIER) { uint32_t bits; memcpy(&bits, aq, sizeof bits); if (bits && !csh_barrier_pass()) { g_csh_stop[5]++; break; } continue; }
         if (hq.op == OP_DRAW || hq.op == OP_DRAW_IDX) {
             p_draw tdw; p_draw_idx tdi; const p_draw *d = hq.op == OP_DRAW ? draw_rec(aq, hq.size, &tdw) : NULL; const p_draw_idx *x = hq.op == OP_DRAW_IDX ? draw_idx_rec(aq, hq.size, &tdi) : NULL;
             prog_resolve(); __unsafe_unretained NvProg *pr = S.prog ? prog_get(S.prog) : nil;
@@ -16415,7 +16420,11 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_TEX: clear_tex(a); break;
             case OP_DLSS: dlss_eval(a); break;
             case OP_DISPATCH: if (g_csh_n && csh_take(p)) { PD("H %llu dispatch already run ahead of the pass", g_stat_pass); break; }
-                dispatch(a); break;
+                // A dispatch left in place ends the open pass, which stores its depth: that is a split the later depth-sampling dispatches can run on (DM_NVN_CSH_DEPTH=split).
+                // Recorded only where a scan refused one, the first emitter after the scene's draws kept a pass of its own
+                { int open = g_enc != nil; dispatch(a);
+                  if (open && !g_enc && csh_depth_split() && R.rt.depth) { g_csh_split_ser = R.rt.depth->serial; g_csh_split_fence = atomic_load_explicit(&g_fence, memory_order_relaxed); } }
+                break;
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4);   // ordered at the next draw pass (barrier_game); inside a pass with shader writes, the pass ends first (swrite_note); in one without, before its next write (prog_swrites)
                 int order = g_enc && (bits & (NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT)), split = order && g_pass_swrite;
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : order ? " (render pass open; a later shader write is ordered after its draws)" : g_enc ? " (render pass open)" : "");

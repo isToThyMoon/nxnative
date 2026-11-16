@@ -166,6 +166,7 @@ DM_NVN_CMDSTAT	diagnostic	`=1` logs every 300 frames the command recording usage
 DM_NVN_COUNT	diagnostic	`1` counts every NVN call (the counting trampolines) and writes the per-frame call lines; off by default (on with a `DM_NVN_TSV` table that has call rows), the count is an atomic add all recording threads share
 DM_NVN_CPUPROF	diagnostic	1 records CPU wall/time/instruction totals by renderer operation; off by default.
 DM_NVN_CSH_PRESCAN	diagnostic	`0` runs the compute-hoist scan at every pass's first draw even when no dispatch follows (as before; for timing)
+DM_NVN_CSH_BARRIER	switch	the scan that moves compute dispatches ahead of a render pass goes on past game barriers, so both dispatches of each particle emitter move and the pass stays open; on with `DM_NVN_CSH_DEPTH=split` (`0` off, `1` on without it)
 DM_NVN_CSH_DEPTH	switch	`=split`: after a compute dispatch that samples the depth attachment has split a render pass, the later such dispatches of that pass run where the pass reopens, on the depth stored at that split (they miss depth the draws in between wrote); off by default
 DM_NVN_CS_HOIST	switch	`0` makes a compute dispatch between the draws of a pass end it (on by default: the dispatch runs ahead of the pass when that changes nothing the draws before it read)
 DM_NVN_CUT	switch	`=<draws>`: the replay commits its command buffer every that many draws, between passes (default 64; `0` one command buffer per submission, except the cut after a buffer-to-texture copy)
