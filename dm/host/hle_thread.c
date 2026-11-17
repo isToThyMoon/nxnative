@@ -1071,7 +1071,7 @@ void dm_all_thread_cpu(char *out, size_t n, double secs) {
 // stacks seen most go to the log as "[prof] '<thread>' <samples>: leaf < caller < ...", symbols by dladdr. Nothing is allocated or logged while a thread is suspended
 static void *tprof_main(void *arg) {
     int hz = (int)(intptr_t)arg; pthread_setname_np("dm-thread-prof");
-    enum { MAXT = 8, D = 10, HN = 1 << 14, NP = 160 };
+    enum { MAXT = 8, D = 12, HN = 1 << 14, NP = 160 };
     typedef struct { uint64_t pc[D]; uint32_t n; char name[28]; } ent;
     ent *h = calloc(HN, sizeof *h); if (!h) return NULL;
     static struct { uint64_t id, us; } prev[NP]; int nprev = 0;
@@ -1126,9 +1126,10 @@ static void *tprof_main(void *arg) {
             dm_log("[prof] %llu samples of running threads in 20 s at %d Hz (%llu not kept)", (unsigned long long)total, hz, (unsigned long long)lost);
             for (int r = 0; r < 220; r++) { int b = -1; for (int i = 0; i < HN; i++) if (h[i].n && (b < 0 || h[i].n > h[b].n)) b = i;
                 if (b < 0 || h[b].n < 2) break;
-                char line[900]; int p = snprintf(line, sizeof line, "[prof] '%s' %u:", h[b].name, h[b].n);
+                char line[1200]; int p = snprintf(line, sizeof line, "[prof] '%s' %u:", h[b].name, h[b].n);
                 for (int i = 0; i < D && h[b].pc[i] && p < (int)sizeof line - 90; i++) { Dl_info di; memset(&di, 0, sizeof di); uint64_t a = h[b].pc[i] - (i ? 4 : 0);
-                    if (dladdr((void *)a, &di) && di.dli_sname) p += snprintf(line + p, sizeof line - p, "%s%.60s", i ? " < " : " ", di.dli_sname);
+                    // A system library's private symbols come back as "<redacted>" on iOS: the image and offset then, for atos against Xcode's device support copy
+                    if (dladdr((void *)a, &di) && di.dli_sname && strcmp(di.dli_sname, "<redacted>")) p += snprintf(line + p, sizeof line - p, "%s%.60s", i ? " < " : " ", di.dli_sname);
                     else if (di.dli_fname) { const char *bn = strrchr(di.dli_fname, '/'); p += snprintf(line + p, sizeof line - p, "%s%.30s+%#llx", i ? " < " : " ", bn ? bn + 1 : di.dli_fname, (unsigned long long)(a - (uint64_t)di.dli_fbase)); }
                     else p += snprintf(line + p, sizeof line - p, "%s%#llx", i ? " < " : " ", (unsigned long long)a); }
                 dm_log("%s", line); h[b].n = 0; }

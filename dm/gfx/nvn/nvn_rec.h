@@ -142,7 +142,9 @@ static void rec_note_wait(_Atomic uint64_t *p, uint64_t v) {
 static id g_rx_cb, g_rx_enc;   // the encode thread's real command buffer and open encoder
 static void fxt_exec(const uint32_t op, const uint64_t *a);   // nvn_mtl.m
 static void rec_exec(const rec_t *r) {
-    const uint64_t *a = r->a; id e = g_rx_enc;
+    // Not a strong local: that retained and released the open encoder around every record, 8% of this thread's samples on an iPhone (objc_retain / objc_release under
+    // rec_thread, tens of thousands of records a frame). g_rx_enc holds the encoder until RO_END, which uses e before it clears it
+    const uint64_t *a = r->a; __unsafe_unretained id e = g_rx_enc;
     switch (r->op) {
     case RO_CB_NEW: g_rx_cb = [g_dev newCommandBuffer]; break;
     case RO_CB_BEGIN: [(id<MTL4CommandBuffer>)g_rx_cb beginCommandBufferWithAllocator:rec_id(a[0])]; break;
