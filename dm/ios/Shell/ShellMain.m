@@ -238,6 +238,11 @@ static UIInterfaceOrientationMask shell_orientations(UITraitCollection *traits) 
 // setting MetalFX scales the picture.
 static void metal_hud_per_layer(void) {
     if (getenv("MTL_HUD_ENABLED")) { fprintf(stderr, "shell: MTL_HUD_ENABLED given at launch, the HUD follows it\n"); return; }   // Xcode, devicectl: it wins
+    // Documents/metal-hud-off: Metal's HUD library is not loaded at all. Loaded, it replaces the command buffer's and the encoders' methods whether or not a layer shows it,
+    // so every render pass a game opens and ends goes through it (Breath of the Wild on an iPhone 17 Pro Max: 120-146 passes a frame, a third of the encode thread's
+    // samples under its renderCommandEncoderWithDescriptor wrapper). The Performance HUD setting then does nothing until the file is removed
+    if ([NSFileManager.defaultManager fileExistsAtPath:[documents() stringByAppendingPathComponent:@"metal-hud-off"]]) {
+        fprintf(stderr, "shell: Documents/metal-hud-off is there, Metal's HUD library is not loaded (the Performance HUD setting has no effect)\n"); return; }
     setenv("MTL_HUD_ENABLED", "1", 1);
     setenv("DM_HUD_PER_LAYER", "1", 1);
     fprintf(stderr, "shell: Metal's HUD is ready, each game's Performance HUD setting turns it on at Play\n");
