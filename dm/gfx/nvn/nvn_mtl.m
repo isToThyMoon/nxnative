@@ -14680,7 +14680,7 @@ static int csh_depth_split(void) { static int v = -1; if (v < 0) { const char *e
 // Game barriers between the dispatches of a pass (Breath of the Wild's particle emitters: draw, dispatch, barrier bits 1, dispatch, draw …). The scan used to stop at one, so
 // of each emitter's two dispatches the second stayed in place and ended the pass: every attachment stored and loaded again per emitter (iPhone 17 Pro Max, five 1280x720
 // targets: 36.8 MB each, 1–3 a frame). A barrier orders earlier GPU writes before what follows; the dispatches moved ahead keep their own order, the draws passed write only
-// attachments, and attachments are what csh_cs checks, so the scan goes on past it. On with DM_NVN_CSH_DEPTH=split (0 off, 1 on without it)
+// attachments, and attachments are what csh_cs checks, so the scan goes on past it. On with DM_NVN_CSH_DEPTH=split (0 off, which also turns off the split recorded where a dispatch ends a pass; 1 on without it)
 static int csh_barrier_pass(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_CSH_BARRIER"); v = e ? strcmp(e, "0") != 0 : csh_depth_split(); } return v; }
 static char g_csh_why[96];   // why csh_cs refused the last dispatch (logged once per shader)
 #define CSH_NO(...) do { snprintf(g_csh_why, sizeof g_csh_why, __VA_ARGS__); return 0; } while (0)
@@ -16423,7 +16423,7 @@ void mtl_exec(const uint8_t *p) {
                 // A dispatch left in place ends the open pass, which stores its depth: that is a split the later depth-sampling dispatches can run on (DM_NVN_CSH_DEPTH=split).
                 // Recorded only where a scan refused one, the first emitter after the scene's draws kept a pass of its own
                 { int open = g_enc != nil; dispatch(a);
-                  if (open && !g_enc && csh_depth_split() && R.rt.depth) { g_csh_split_ser = R.rt.depth->serial; g_csh_split_fence = atomic_load_explicit(&g_fence, memory_order_relaxed); } }
+                  if (open && !g_enc && csh_depth_split() && csh_barrier_pass() && R.rt.depth) { g_csh_split_ser = R.rt.depth->serial; g_csh_split_fence = atomic_load_explicit(&g_fence, memory_order_relaxed); } }
                 break;
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4);   // ordered at the next draw pass (barrier_game); inside a pass with shader writes, the pass ends first (swrite_note); in one without, before its next write (prog_swrites)
                 int order = g_enc && (bits & (NVN_BARRIER_ORDER_PRIMITIVES_BIT | NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT)), split = order && g_pass_swrite;
