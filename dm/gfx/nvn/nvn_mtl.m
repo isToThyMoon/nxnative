@@ -5183,6 +5183,15 @@ static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw,
 static int g_kd_force;   // the draw DM_NVN_KEYDUMP matched: force the per-binding records on (see kd_draw)
 static _Atomic long g_pd_a0 = -2, g_pd_a1;   // the frames dumped (inclusive); -2 = DM_NVN_PASSDUMP not read yet, -3 = DM_NVN_PASSDUMP=every:<n>
 static long g_pd_every;
+static double g_pd_gpu_ms; static long g_pd_gpu_left, g_pd_gpu_t = -1, g_pd_gpu_seen, g_pd_gpu_next;   // DM_NVN_PASSDUMP=gpu:<ms>[:<n>]: the threshold, dumps left, the frame being dumped
+// One frame's passes when a finished frame's GPU time reached the threshold, at most n times (4) and 90 frames apart: for a burst no frame number can be timed to
+// (Breath of the Wild closing the inventory: a dozen frames at 25-33 ms)
+static int passdump_gpu(long f) {
+    if (f != g_pd_gpu_seen) { g_pd_gpu_seen = f;
+        if (g_pd_gpu_left > 0 && f >= g_pd_gpu_next) for (long k = 2; k <= 6 && k < f; k++) if (mtl_gpu_ms((uint64_t)(f - k)) >= g_pd_gpu_ms) {
+            g_pd_gpu_left--; g_pd_gpu_t = f + 1; g_pd_gpu_next = f + 90; MLOG("DM_NVN_PASSDUMP=gpu: frame %ld took %.1f ms on the GPU, frame %ld is dumped", f - k, mtl_gpu_ms((uint64_t)(f - k)), f + 1); break; } }
+    return f == g_pd_gpu_t;
+}
 static inline int passdump(void) {
     if (g_kd_force) return 1;
 #ifdef NVN_RT_RANGE_TEST
@@ -5190,10 +5199,12 @@ static inline int passdump(void) {
 #endif
     if (__builtin_expect(g_pd_a0 == -1, 1)) return 0;   // off (the usual case): answered first, it is asked for every binding of every draw
     if (g_pd_a0 == -2) { const char *e = getenv("DM_NVN_PASSDUMP");
-        if (e && !strncmp(e, "every:", 6)) { g_pd_every = atol(e + 6); g_pd_a1 = -1; g_pd_a0 = g_pd_every > 0 ? -3 : -1; }   // one frame in every n, halfway between two DM_NVN_GPUPROF=every:n frames
+        if (e && !strncmp(e, "gpu:", 4)) { g_pd_gpu_ms = atof(e + 4); const char *c = strchr(e + 4, ':'); g_pd_gpu_left = c ? atol(c + 1) : 4; g_pd_a1 = -1; g_pd_a0 = g_pd_gpu_ms > 0 ? -4 : -1; }
+        else if (e && !strncmp(e, "every:", 6)) { g_pd_every = atol(e + 6); g_pd_a1 = -1; g_pd_a0 = g_pd_every > 0 ? -3 : -1; }   // one frame in every n, halfway between two DM_NVN_GPUPROF=every:n frames
         else { g_pd_a1 = e && strchr(e, '-') ? atol(strchr(e, '-') + 1) : e ? atol(e) : -1; g_pd_a0 = e ? atol(e) : -1; } }
     long f = (long)atomic_load(&g_cur_frame), a0 = g_pd_a0;
     if (a0 == -3) return f > 0 && f % g_pd_every == g_pd_every / 2;
+    if (a0 == -4) return passdump_gpu(f);
     return a0 >= 0 && f >= a0 && f <= g_pd_a1;
 }
 // The next n frames' passes, on request (the Mac's DM_CTL "passdump n", hle_hid.c): for a scene that a fixed DM_NVN_PASSDUMP frame range cannot be timed to
